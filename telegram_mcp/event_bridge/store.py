@@ -662,8 +662,6 @@ class SQLiteStore:
                 return StoredSource(sequence, source_id, event_id, watch_id, epoch, record)
         except StoreUnavailable:
             self._volatile[(owner_id, watch_id)] = Health("degraded", "storage_failure", 1, 0)
-            # The failed content transaction was rolled back. Preserve the gap in
-            # a separate small control transaction when the disk still permits it.
             try:
                 with self._transaction() as db:
                     self._gap(db, owner_id, watch_id, "storage_failure")
@@ -923,6 +921,20 @@ class SQLiteStore:
             )
             return True
 
+    def _obligation_versions(self, db, owner_id, watch_id, ids):
+        versions = {}
+        ids = tuple(ids)
+        for offset in range(0, len(ids), 500):
+            chunk = ids[offset : offset + 500]
+            rows = db.execute(
+                "SELECT obligation,version FROM obligations WHERE owner=? AND watch=? AND obligation IN ("
+                + ",".join("?" for _ in chunk)
+                + ")",
+                (owner_id, watch_id, *chunk),
+            )
+            versions.update((row[0], row[1]) for row in rows)
+        return versions
+
     def analysis_snapshot(self, owner_id, watch_id, epoch, obligation_ids=()):
         ids = tuple(sorted(set(obligation_ids)))
         if len(ids) > 100:
@@ -934,14 +946,14 @@ class SQLiteStore:
             watermark = db.execute(
                 "SELECT watermark FROM watches WHERE owner=? AND watch=?", (owner_id, watch_id)
             ).fetchone()[0]
-            versions = []
-            for value in ids:
-                row = db.execute(
-                    "SELECT version FROM obligations WHERE owner=? AND watch=? AND obligation=?",
-                    (owner_id, watch_id, value),
-                ).fetchone()
-                versions.append((value, row[0] if row else 0))
-            return AnalysisSnapshot(owner_id, watch_id, epoch, watermark, tuple(versions))
+            versions = self._obligation_versions(db, owner_id, watch_id, ids)
+            return AnalysisSnapshot(
+                owner_id,
+                watch_id,
+                epoch,
+                watermark,
+                tuple((value, versions.get(value, 0)) for value in ids),
+            )
 
     def commit_analysis(self, snapshot, changes):
         if not isinstance(snapshot, AnalysisSnapshot) or any(
@@ -966,20 +978,28 @@ class SQLiteStore:
             ).fetchone()[0]
             if watermark != snapshot.watermark:
                 return False
-            for obligation, version in expected.items():
-                row = db.execute(
-                    "SELECT version FROM obligations WHERE owner=? AND watch=? AND obligation=?",
-                    (snapshot.owner_id, snapshot.watch_id, obligation),
-                ).fetchone()
-                if (row[0] if row else 0) != version:
-                    return False
-            for change in changes:
-                for seq in change.evidence:
-                    if not db.execute(
-                        "SELECT 1 FROM source_events WHERE owner=? AND watch=? AND epoch=? AND seq=?",
-                        (snapshot.owner_id, snapshot.watch_id, snapshot.epoch, seq),
-                    ).fetchone():
-                        raise ScopeDenied("Evidence must belong to this active watch epoch")
+            versions = self._obligation_versions(
+                db, snapshot.owner_id, snapshot.watch_id, expected
+            )
+            if any(
+                versions.get(obligation, 0) != version for obligation, version in expected.items()
+            ):
+                return False
+            evidence = tuple({seq for change in changes for seq in change.evidence})
+            found = set()
+            for offset in range(0, len(evidence), 500):
+                chunk = evidence[offset : offset + 500]
+                found.update(
+                    row[0]
+                    for row in db.execute(
+                        "SELECT seq FROM source_events WHERE owner=? AND watch=? AND epoch=? AND seq IN ("
+                        + ",".join("?" for _ in chunk)
+                        + ")",
+                        (snapshot.owner_id, snapshot.watch_id, snapshot.epoch, *chunk),
+                    )
+                )
+            if len(found) != len(evidence):
+                raise ScopeDenied("Evidence must belong to this active watch epoch")
             documents = [_json(asdict(c)) for c in changes]
             if not self._capacity(
                 db,
