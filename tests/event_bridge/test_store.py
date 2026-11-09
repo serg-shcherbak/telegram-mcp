@@ -205,6 +205,7 @@ def test_source_and_outbox_rollback_together_on_storage_error(tmp_path):
             db.execute(
                 "CREATE TRIGGER refuse_delivery BEFORE INSERT ON deliveries BEGIN SELECT RAISE(ABORT, 'injected failure'); END"
             )
+        db.close()
         with pytest.raises(StoreUnavailable):
             store.append_source(
                 "owner", "watch", watch.epoch, record(), deliveries=(DeliveryRequest("r", "s"),)
