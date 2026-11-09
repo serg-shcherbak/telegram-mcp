@@ -210,6 +210,22 @@ def test_http_transport_discovery_get_probe():
         assert response.headers.get("mcp-protocol-version") == "2026-07-28"
 
 
+def test_http_discovery_does_not_mask_oauth_routes():
+    app = create_streamable_http_app(mcp)
+    with TestClient(app, base_url="http://localhost:8765") as client:
+        response = client.get("/.well-known/oauth-authorization-server")
+        assert response.status_code == 404
+
+
+def test_http_discovery_uses_configured_mcp_path():
+    from mcp.server.fastmcp import FastMCP
+
+    instance = FastMCP("custom-path", streamable_http_path="/private-mcp")
+    with TestClient(create_streamable_http_app(instance)) as client:
+        assert client.get("/private-mcp").json()["name"] == "telegram"
+        assert client.get("/mcp").status_code == 404
+
+
 def test_http_transport_modern_stateless_tools_list():
     """Verify modern 2026-07-28 stateless call to tools/list executes cleanly."""
     app = create_streamable_http_app(mcp)
