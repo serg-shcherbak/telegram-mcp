@@ -33,8 +33,6 @@ async def observe_send(client, entity, result, *, reply_to=None):
         if message is None:
             message = result if getattr(result, "id", None) else None
         if message is None or not getattr(message, "date", None):
-            # Acceptance without a full message needs selected history repair;
-            # there is deliberately no automatic second send.
             target_watches = [
                 w
                 for w in ingress.store.list(ingress.owner_id)

@@ -95,7 +95,7 @@ def apply_analysis(store, snapshot, results):
     changes = tuple(
         ObligationChange(
             r.obligation_id,
-            r.state if r.confidence >= 0.8 else "needs_review",
+            r.state,
             r.summary,
             r.evidence,
             confidence=r.confidence,

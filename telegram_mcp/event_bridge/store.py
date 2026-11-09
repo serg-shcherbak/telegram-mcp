@@ -1157,7 +1157,7 @@ class SQLiteStore:
             if tuple(r["seq"] for r in rows) != tuple(sequences):
                 return None
             cursor = db.execute(
-                "SELECT cursor FROM policy_progress WHERE owner=? AND watch=? AND epoch=?",
+                "SELECT cursor,last_wake FROM policy_progress WHERE owner=? AND watch=? AND epoch=?",
                 (owner, watch_id, epoch),
             ).fetchone()
             if cursor and cursor[0] >= current:
@@ -1182,8 +1182,6 @@ class SQLiteStore:
                 }
                 unseen_by_recipient[recipient] = [r for r in rows if r["source_id"] not in known]
             requests = tuple(r for r in requests if unseen_by_recipient[r.recipient_id])
-            if incoming and watch.active.policy.wake_dot and deliveries and not requests:
-                incoming = False
             if incoming and watch.active.policy.wake_dot and not deliveries:
                 return None
             bucket = _time(now.replace(minute=0, second=0, microsecond=0))
@@ -1239,18 +1237,12 @@ class SQLiteStore:
                     owner,
                     watch_id,
                     batches=len(groups),
-                    deliveries=len(set(requests)),
+                    deliveries=len(requests),
                     size=sum(len(_json(payload).encode()) for payload, _ in groups.values()),
                 ):
                     return None
-                budget_exists = db.execute(
-                    "SELECT 1 FROM budget_buckets WHERE owner=? AND watch=? AND name='packet' AND bucket=?",
-                    (owner, watch_id, bucket),
-                ).fetchone()
-                new_global = not db.execute(
-                    "SELECT 1 FROM policy_global_budgets WHERE owner=? AND bucket=?",
-                    (owner, bucket),
-                ).fetchone()
+                budget_exists = own is not None
+                new_global = used_row is None
                 keys = (
                     db.execute(
                         "SELECT COUNT(*) FROM budget_buckets WHERE owner=?", (owner,)
@@ -1283,11 +1275,7 @@ class SQLiteStore:
                             for sid in source_ids
                         ),
                     )
-            previous = db.execute(
-                "SELECT last_wake FROM policy_progress WHERE owner=? AND watch=? AND epoch=?",
-                (owner, watch_id, epoch),
-            ).fetchone()
-            last = _time(now) if requests else (previous[0] if previous else None)
+            last = _time(now) if requests else (cursor["last_wake"] if cursor else None)
             db.execute(
                 "INSERT INTO policy_progress(owner,watch,epoch,cursor,last_wake) VALUES(?,?,?,?,?) ON CONFLICT(owner,watch) DO UPDATE SET epoch=excluded.epoch,cursor=excluded.cursor,last_wake=excluded.last_wake",
                 (owner, watch_id, epoch, current, last),

@@ -88,29 +88,33 @@ class ScopedIngress:
     async def deleted(self, event):
         kind = "telegram.message.deleted"
         ids = tuple(getattr(event, "deleted_ids", ()) or ())[:100]
+        if not ids:
+            return ()
         result = []
         # Telegram omits the peer for ordinary private/group deletions. Attribute
         # only known journal entries, never infer a chat from the message ID alone.
+        by_id = {mid: {} for mid in ids}
+        for watch in self.store.list(self.owner_id):
+            if watch.state != WatchState.ACTIVE or not watch.active:
+                continue
+            if kind not in watch.active.capabilities:
+                continue
+            for source in self._sources(watch.watch_id):
+                target = source.record.target
+                if (
+                    source.epoch == watch.epoch
+                    and source.record.message_id in by_id
+                    and target.account_id == self.account_id
+                    and matches_scope(watch.active.scope, target)
+                    and (
+                        not getattr(event, "chat_id", None)
+                        or target.marked_chat_id == event.chat_id
+                    )
+                ):
+                    candidates = by_id[source.record.message_id]
+                    candidates.setdefault(target, {})[watch.watch_id] = watch
         for mid in ids:
-            candidates = {}
-            for watch in self.store.list(self.owner_id):
-                if watch.state != WatchState.ACTIVE or not watch.active:
-                    continue
-                if kind not in watch.active.capabilities:
-                    continue
-                for source in self._sources(watch.watch_id):
-                    target = source.record.target
-                    if (
-                        source.epoch == watch.epoch
-                        and source.record.message_id == mid
-                        and target.account_id == self.account_id
-                        and matches_scope(watch.active.scope, target)
-                        and (
-                            not getattr(event, "chat_id", None)
-                            or target.marked_chat_id == event.chat_id
-                        )
-                    ):
-                        candidates.setdefault(target, {})[watch.watch_id] = watch
+            candidates = by_id[mid]
             if len(candidates) != 1:
                 continue
             target, watches = next(iter(candidates.items()))
