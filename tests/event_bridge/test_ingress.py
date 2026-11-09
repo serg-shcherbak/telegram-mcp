@@ -77,6 +77,21 @@ async def test_topic_scope_edits_outgoing_dedup_and_delete(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_two_edits_in_same_second_keep_distinct_update_versions(tmp_path):
+    with SQLiteStore(tmp_path / "db") as store:
+        setup(store)
+        ingress = ScopedIngress(store, owner_id="o", account_id="a")
+        e = event()
+        e.message.edit_date = NOW
+        e.original_update = NS(pts=10)
+        first = await ingress.message(e, edited=True)
+        e.original_update = NS(pts=11)
+        second = await ingress.message(e, edited=True)
+        assert first[0].source_id != second[0].source_id
+        assert len(store.get_sources("o", "w")) == 2
+
+
+@pytest.mark.asyncio
 async def test_backfill_is_selected_bounded_and_reports_incomplete(tmp_path):
     with SQLiteStore(tmp_path / "db") as store:
         setup(store)

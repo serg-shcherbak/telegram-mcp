@@ -58,12 +58,16 @@ class ScopedIngress:
             metadata["reply_to_message_id"] = reply_id
         if getattr(msg, "media", None) is not None:
             metadata["media_type"] = "unsupported"
+        version = date.isoformat() if edited else "1"
+        pts = getattr(getattr(event, "original_update", None), "pts", None)
+        if edited and type(pts) is int:
+            version = f"{version}:{pts}"
         record = SourceRecord(
             target,
             kind,
             msg.id,
             date,
-            version=date.isoformat() if edited else "1",
+            version=version,
             metadata=metadata,
         )
         return self._append(watches, record)
