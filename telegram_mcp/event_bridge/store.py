@@ -1458,16 +1458,31 @@ class SQLiteStore:
                 )
             )
 
-    def save_subscription(self, owner, identity, subscription, watch_id, epoch, expires, document):
+    def save_subscription(
+        self,
+        owner,
+        identity,
+        subscription,
+        watch_id,
+        epoch,
+        expires,
+        document,
+        *,
+        expected_document,
+    ):
         with self._transaction() as db:
             self._active(db, owner, watch_id, epoch)
+            existing = db.execute(
+                "SELECT document FROM event_subscriptions WHERE owner=? AND identity=?",
+                (owner, identity),
+            ).fetchone()
+            # A later unsubscribe or refresh wins over verification already in flight.
+            if (existing["document"] if existing else None) != expected_document:
+                raise ScopeDenied("Subscription changed during callback verification")
             db.execute(
                 "DELETE FROM event_frontiers WHERE owner=? AND subscription NOT IN (SELECT subscription FROM event_subscriptions WHERE owner=?)",
                 (owner, owner),
             )
-            existing = db.execute(
-                "SELECT 1 FROM event_subscriptions WHERE owner=? AND identity=?", (owner, identity)
-            ).fetchone()
             if (
                 not existing
                 and db.execute(
@@ -1558,34 +1573,24 @@ class SQLiteStore:
             ).fetchone()
             return dict(row) if row else None
 
-    def replay_events(self, owner, subscription, after):
-        with self._transaction() as db:
-            rows = db.execute(
-                "SELECT h.seq,d.event_id,d.state FROM event_history h JOIN deliveries d ON d.owner=h.owner AND d.event_id=h.event_id WHERE d.owner=? AND d.subscription=? ORDER BY h.seq LIMIT 1001",
-                (owner, subscription),
-            ).fetchall()
-            selected = tuple(dict(r) for r in rows if r["seq"] > after)
-            return selected[:100], len(selected) > 100
-
     def request_replay(self, owner, subscription, after, *, now):
         """Stage bounded retained receipts; actual repeat POSTs share packet budgets."""
         with self._transaction() as db:
             rows = db.execute(
-                "SELECT h.seq,d.event_id FROM event_history h JOIN deliveries d ON d.owner=h.owner AND d.event_id=h.event_id WHERE d.owner=? AND d.subscription=? ORDER BY h.seq",
-                (owner, subscription),
+                "SELECT h.seq,d.event_id FROM event_history h JOIN deliveries d ON d.owner=h.owner AND d.event_id=h.event_id WHERE d.owner=? AND d.subscription=? AND h.seq>? ORDER BY h.seq LIMIT 101",
+                (owner, subscription, after),
             ).fetchall()
             saved = db.execute(
                 "SELECT floor FROM event_frontiers WHERE owner=? AND subscription=?",
                 (owner, subscription),
             ).fetchone()
             floor = saved[0] if saved else 0
-            selected = [r for r in rows if r["seq"] > after]
-            for row in selected[:100]:
+            for row in rows[:100]:
                 db.execute(
                     "INSERT OR IGNORE INTO event_replays VALUES(?,?,?)",
                     (owner, subscription, row["event_id"]),
                 )
-            return bool((floor and after <= floor) or len(selected) > 100)
+            return bool((floor and after <= floor) or len(rows) > 100)
 
     def _packet_gate(self, db, owner, watch, requests, now):
         from .policies import _quiet
@@ -1669,11 +1674,6 @@ class SQLiteStore:
 
     def dispatch_replays(self, owner, subscription, *, now):
         with self._transaction() as db:
-            exists = db.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='event_replays'"
-            ).fetchone()
-            if not exists:
-                return
             rows = db.execute(
                 "SELECT d.*,b.watch,b.epoch FROM event_replays r JOIN deliveries d ON d.owner=r.owner AND d.subscription=r.subscription AND d.event_id=r.event_id JOIN delivery_batches b ON b.owner=d.owner AND b.event_id=d.event_id WHERE r.owner=? AND r.subscription=? ORDER BY d.due LIMIT 100",
                 (owner, subscription),
@@ -1746,7 +1746,7 @@ class SQLiteStore:
                 return False
             row = self._delivery_row(db, owner, delivery_id)
             if row["attempts"] <= 1:
-                return True  # First attempt was reserved atomically at publication.
+                return True
             watch = self._active(db, owner, row["watch"], row["epoch"])
             if self._packet_gate(
                 db, owner, watch, (DeliveryRequest(row["recipient"], row["subscription"]),), now

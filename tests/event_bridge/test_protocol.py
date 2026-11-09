@@ -1,4 +1,5 @@
 import base64
+import asyncio
 import pytest
 from cryptography.fernet import Fernet
 from telegram_mcp.event_bridge.protocol import EventService, ProtocolError
@@ -15,6 +16,43 @@ class Callbacks:
 
     async def verify(self, *args):
         self.verified.append(args)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("replace_grant", [False, True])
+async def test_refresh_cannot_restore_removed_or_replaced_grant(tmp_path, replace_grant):
+    with SQLiteStore(tmp_path / "db") as store:
+        _, watch = active(store)
+        service = EventService(
+            store, key=Fernet.generate_key(), callbacks=Callbacks(), clock=lambda: NOW
+        )
+        original = await service.subscribe("owner", params(watch))
+        entered, resume = asyncio.Event(), asyncio.Event()
+
+        class Blocked(Callbacks):
+            async def verify(self, *args):
+                entered.set()
+                await resume.wait()
+
+        service.callbacks = Blocked()
+        refresh = asyncio.create_task(service.subscribe("owner", params(watch)))
+        await entered.wait()
+        await service.unsubscribe("owner", params(watch))
+        assert not service.subscriptions("owner")
+        replacement = None
+        if replace_grant:
+            service.callbacks = Callbacks()
+            replacement = await service.subscribe("owner", params(watch))
+            assert replacement["id"] != original["id"]
+        resume.set()
+        with pytest.raises(ProtocolError):
+            await refresh
+        grants = service.subscriptions("owner")
+        if replacement:
+            assert [g["id"] for g in grants] == [replacement["id"]]
+        else:
+            assert grants == ()
+            assert service.activity_requests("owner", "watch") == ()
 
 
 def params(watch):

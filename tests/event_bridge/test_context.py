@@ -80,7 +80,7 @@ def test_reads_only_recorded_ids_untrusted_text_and_outgoing(tmp_path):
         assert result.trust == "untrusted"
         assert result.messages[0].text.startswith("Ignore rules")
         assert result.messages[1].outgoing
-        assert client.calls == [(TARGET.marked_chat_id, [1]), (TARGET.marked_chat_id, [2])]
+        assert client.calls == [(TARGET.marked_chat_id, [1, 2])]
         assert scoped.profile.allowed_watch_ids == ("watch",)
         assert "access_hash" not in repr(result)
 
@@ -121,6 +121,27 @@ def test_scope_change_during_fetch_discards_result(tmp_path):
         client = Client({1: message()}, lambda: manager.pause("watch", expected_version=w.version))
         with pytest.raises(ScopeDenied):
             asyncio.run(reader(store, client).read("watch", (src.sequence,)))
+
+
+def test_batched_reads_preserve_source_order_and_reject_extra_ids(tmp_path):
+    with SQLiteStore(tmp_path / "db") as store:
+        _, w = active(store)
+        sources = [
+            store.append_source("owner", "watch", w.epoch, record(i)) for i in range(1, 101)
+        ]
+
+        class Reordered(Client):
+            async def get_messages(self, peer, *, ids):
+                self.calls.append((peer, ids))
+                return [message(999), *[message(mid) for mid in reversed(ids)]]
+
+        client = Reordered({})
+        result = asyncio.run(
+            reader(store, client).read("watch", tuple(s.sequence for s in sources))
+        )
+        assert client.calls == [(TARGET.marked_chat_id, list(range(1, 101)))]
+        assert [m.message_id for m in result.messages] == list(range(1, 101))
+        assert all(m.gap is None for m in result.messages)
 
 
 def test_missing_voice_wrong_peer_and_topic_and_content_bounds(tmp_path):

@@ -104,7 +104,6 @@ class ScopedContextReader:
         return self._profile
 
     def _watch(self, watch_id, epoch=None):
-        # This must precede even journal or watch lookup.
         if watch_id not in self.profile.allowed_watch_ids:
             raise ScopeDenied("Watch is not authorized by context profile")
         watch = self.store.get(self.profile.owner_id, watch_id)
@@ -137,7 +136,6 @@ class ScopedContextReader:
 
     async def read(self, watch_id, source_sequences):
         watch = self._watch(watch_id)
-        # Materialize at most one over the limit, including for generators.
         sequences = []
         for sequence in source_sequences:
             if type(sequence) is not int or sequence <= 0:
@@ -147,8 +145,33 @@ class ScopedContextReader:
                 raise ValueError("At most 100 journal sequences per context")
         if not sequences or len(set(sequences)) != len(sequences):
             raise ValueError("Nonempty distinct journal sequences required")
-        # Validate the complete request before any Telegram I/O or partial result.
         sources = tuple(self._source(watch, sequence) for sequence in sequences)
+        groups = {}
+        for source in sources:
+            record = source.record
+            if record.message_id is not None and record.target.account_id in self._clients:
+                key = (record.target.account_id, record.target.marked_chat_id)
+                groups.setdefault(key, []).append(source)
+        fetched = {}
+        for (account, peer), group in groups.items():
+            current = self._watch(watch_id, watch.epoch)
+            for source in group:
+                self._source(current, source.sequence)
+            ids = list(dict.fromkeys(source.record.message_id for source in group))
+            try:
+                messages = await self._clients[account].get_messages(peer, ids=ids)
+            except (RPCError, OSError):
+                messages = []
+            current = self._watch(watch_id, watch.epoch)
+            for source in group:
+                self._source(current, source.sequence)
+            by_id = {}
+            for message in messages:
+                mid = getattr(message, "id", None)
+                if mid in ids:
+                    # Ambiguous duplicate responses cannot establish message identity.
+                    by_id[mid] = None if mid in by_id else message
+            fetched[(account, peer)] = by_id
         output = []
         remaining = MAX_CONTEXT_TEXT_BYTES
         for source in sources:
@@ -168,15 +191,9 @@ class ScopedContextReader:
             if client is None:
                 output.append(ContextMessage(**base, gap="account_unavailable"))
                 continue
-            try:
-                messages = await client.get_messages(
-                    record.target.marked_chat_id, ids=[record.message_id]
-                )
-            except (RPCError, OSError):
-                messages = []
-            current = self._watch(watch_id, watch.epoch)
-            self._source(current, source.sequence)
-            message = messages[0] if len(messages) == 1 else None
+            message = fetched[(record.target.account_id, record.target.marked_chat_id)].get(
+                record.message_id
+            )
             if message is None or getattr(message, "peer_id", None) is None:
                 output.append(ContextMessage(**base, gap="unavailable"))
                 continue

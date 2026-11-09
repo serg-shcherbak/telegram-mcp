@@ -1,5 +1,3 @@
-"""Authenticated MCP Events grants; watch activation remains a separate operation."""
-
 from dataclasses import dataclass
 import hashlib
 import hmac
@@ -14,15 +12,11 @@ from starlette.responses import JSONResponse
 from .callbacks import CallbackClient, CallbackError, decode_secret, validate_callback_url
 from .models import WatchState
 from .scope import ScopeDenied
-from .store import DeliveryRequest
+from .store import DeliveryRequest, _json as canonical
 
 ACTIVITY = "telegram.activity.batch_ready"
 ATTENTION = "telegram.attention.due"
 HEALTH = "telegram.watch.health_changed"
-
-
-def canonical(value):
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
 class ProtocolError(ValueError):
@@ -149,7 +143,6 @@ class EventService:
         except (ValueError, TypeError):
             raise ProtocolError("Invalid callback URL") from None
         identity = hashlib.sha256(canonical((owner, url, name, args)).encode()).hexdigest()
-        # Scope revision is omitted only from recipient overlap dedup semantics.
         recipient = hashlib.sha256(canonical((owner, url, name)).encode()).hexdigest()
         return identity, recipient, url, name, args
 
@@ -254,9 +247,16 @@ class EventService:
         if type(ttl) is not int or ttl <= 0:
             raise ProtocolError("A positive TTL is required")
         ttl = min(ttl, 86400000)
-        # Expired grants are revoked before permitting a fresh verification attempt.
         existing = next(
             (g for g in self.subscriptions(owner, args["watch_id"]) if g["identity"] == identity),
+            None,
+        )
+        expected_document = next(
+            (
+                row["document"]
+                for row in self.store.subscription_rows(owner, args["watch_id"])
+                if row["identity"] == identity
+            ),
             None,
         )
         watch = self._watch(owner, args)
@@ -276,7 +276,6 @@ class EventService:
         )
         if params.get("cursor") is not None:
             position = self.read_cursor(grant, params["cursor"])
-            # A replay request must not skip awaiting receipts.
             if position > self.store.event_position(owner, grant["id"]):
                 raise ProtocolError("Cursor exceeds the receipt frontier")
         else:
@@ -307,10 +306,10 @@ class EventService:
                 watch.epoch,
                 expiry,
                 self.cipher.encrypt(canonical(grant).encode()),
+                expected_document=expected_document,
             )
         except ScopeDenied:
             raise ProtocolError("Watch changed during callback verification") from None
-        # Replay publication is delegated to the same persistent budget gate.
         truncated = False
         if params.get("cursor") is not None:
             truncated = self.store.request_replay(owner, grant["id"], position, now=now)
