@@ -366,7 +366,7 @@ class EventsMiddleware:
     It receives ASGI scope, never JSON-RPC parameters. No anonymous fallback exists.
     """
 
-    def __init__(self, app, service, *, principal_resolver, mcp_path="/mcp"):
+    def __init__(self, app, service, *, principal_resolver, transport_security, mcp_path="/mcp"):
         if not callable(principal_resolver):
             raise ValueError("Trusted authentication resolver required")
         self.app, self.service, self.resolve, self.path = (
@@ -375,6 +375,9 @@ class EventsMiddleware:
             principal_resolver,
             mcp_path.rstrip("/") or "/",
         )
+        from mcp.server.transport_security import TransportSecurityMiddleware
+
+        self.security = TransportSecurityMiddleware(transport_security)
 
     @property
     def router(self):
@@ -391,6 +394,26 @@ class EventsMiddleware:
             return await JSONResponse({"error": "Authentication required"}, status_code=401)(
                 scope, receive, send
             )
+        from starlette.requests import HTTPConnection
+        from telegram_mcp.transport.protocol import (
+            MCP_PROTOCOL_VERSION_HEADER,
+            UnsupportedProtocolVersionError,
+            negotiate_protocol_version,
+        )
+
+        connection = HTTPConnection(scope)
+        rejected = await self.security.validate_request(
+            connection, is_post=scope.get("method") == "POST"
+        )
+        if rejected is not None:
+            return await rejected(scope, receive, send)
+        try:
+            negotiate_protocol_version(connection.headers.get(MCP_PROTOCOL_VERSION_HEADER))
+        except UnsupportedProtocolVersionError as exc:
+            return await JSONResponse(
+                {"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": str(exc)}},
+                status_code=400,
+            )(scope, receive, send)
         if scope.get("method") != "POST":
             return await self.app(scope, receive, send)
         chunks = []

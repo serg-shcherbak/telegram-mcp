@@ -109,7 +109,12 @@ async def test_real_sdk_endpoint_auth_and_tools_regression(tmp_path, json_respon
             return None
 
         base_app = create_streamable_http_app(sdk)
-        app = install_events_adapter(base_app, service, principal_resolver=principal)
+        app = install_events_adapter(
+            base_app,
+            service,
+            principal_resolver=principal,
+            transport_security=sdk.settings.transport_security,
+        )
         async with sdk.session_manager.run():
             async with httpx.AsyncClient(
                 transport=httpx.ASGITransport(app=app), base_url="http://localhost:8000"
