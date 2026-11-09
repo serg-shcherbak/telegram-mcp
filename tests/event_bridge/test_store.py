@@ -179,10 +179,13 @@ def test_budget_restart_retention_and_revoked_delete_cascade(tmp_path):
         )
     with SQLiteStore(path) as store:
         assert not store.reserve_budget("owner", "watch", watch.epoch, "wake", NOW, 1, limit=1)
+        delivery = store.claim_due("owner", now=NOW)[0]
+        assert delivery.event_id == stored.event_id
+        assert store.get_delivery("owner", delivery.delivery_id) is not None
         assert store.prune("owner", before=NOW + timedelta(days=4)) == 1
         assert store.get_sources("owner", "watch") == ()
         assert store.health("owner", "watch").retention_floor > 0
-        assert store.get_delivery("owner", stored.event_id) is None
+        assert store.get_delivery("owner", delivery.delivery_id) is None
         manager = WatchManager(store, owner_id="owner", account_ids=("account",))
         revoked = manager.revoke("watch", expected_version=watch.version)
         manager.delete("watch", expected_version=revoked.version)
