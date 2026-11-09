@@ -92,6 +92,13 @@ class WatchPolicy:
     settle_seconds: int = 45
     max_settle_seconds: int = 180
     min_wake_seconds: int = 300
+    wakes_per_hour: int = 6
+    account_wakes_per_hour: int = 20
+    notifications_per_hour: int = 3
+    account_notifications_per_hour: int = 10
+    quiet_start_minute: Optional[int] = None
+    quiet_end_minute: Optional[int] = None
+    quiet_timezone: str = "Europe/Samara"
     own_outgoing_silent: bool = True
     reminders: bool = False
     transcribe_media: bool = False
@@ -113,6 +120,24 @@ class WatchPolicy:
             value = getattr(self, name)
             if type(value) is not int or value <= 0:
                 raise ValueError("Timing intervals must be positive integer seconds")
+        for name in (
+            "wakes_per_hour",
+            "account_wakes_per_hour",
+            "notifications_per_hour",
+            "account_notifications_per_hour",
+        ):
+            if type(getattr(self, name)) is not int or getattr(self, name) <= 0:
+                raise ValueError("Positive hourly budgets required")
+        if (self.quiet_start_minute is None) != (self.quiet_end_minute is None):
+            raise ValueError("Both quiet-hour bounds are required")
+        if self.quiet_start_minute is not None and any(
+            type(v) is not int or not 0 <= v < 1440
+            for v in (self.quiet_start_minute, self.quiet_end_minute)
+        ):
+            raise ValueError("Quiet-hour bounds are local minutes")
+        from zoneinfo import ZoneInfo
+
+        ZoneInfo(self.quiet_timezone)
         if self.max_settle_seconds < self.settle_seconds:
             raise ValueError("Maximum settling must cover the quiet interval")
         if self.notify and not self.wake_dot:

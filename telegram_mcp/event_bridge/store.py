@@ -258,9 +258,24 @@ class ObligationChange:
     state: str
     summary: str
     evidence: Tuple[int, ...]
+    confidence: float = 1.0
+    due_at: Optional[str] = None
+    due_origin: Optional[str] = None
 
     def __post_init__(self):
         _identifier(self.obligation_id)
+        if type(self.confidence) not in (int, float) or not 0 <= self.confidence <= 1:
+            raise ValueError("Confidence must be in 0..1")
+        if self.confidence < 0.8:
+            object.__setattr__(self, "state", "needs_review")
+            object.__setattr__(self, "due_at", None)
+            object.__setattr__(self, "due_origin", None)
+        if self.due_at is not None:
+            _time(datetime.fromisoformat(self.due_at))
+            if self.due_origin not in ("user", "message"):
+                raise ValueError("Explicit deadline provenance required")
+        elif self.due_origin is not None:
+            raise ValueError("Deadline provenance needs a deadline")
         if self.state not in (
             "needs_review",
             "awaiting_me",
@@ -284,6 +299,13 @@ class Obligation:
     state: str
     summary: str
     evidence: Tuple[int, ...]
+    confidence: float = 1.0
+    due_at: Optional[str] = None
+    due_origin: Optional[str] = None
+
+    @property
+    def expected_actor(self):
+        return {"awaiting_me": "me", "awaiting_them": "them"}.get(self.state)
 
 
 class StoreUnavailable(RuntimeError):
@@ -328,6 +350,21 @@ CREATE TABLE IF NOT EXISTS health (
  reason TEXT NOT NULL DEFAULT '', gaps INTEGER NOT NULL DEFAULT 0,
  retention_floor INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(owner,watch),
  FOREIGN KEY(owner,watch) REFERENCES watches(owner,watch) ON DELETE CASCADE);
+CREATE TABLE IF NOT EXISTS policy_global_budgets (
+ owner TEXT NOT NULL, bucket TEXT NOT NULL, used INTEGER NOT NULL,
+ PRIMARY KEY(owner,bucket));
+CREATE TABLE IF NOT EXISTS policy_progress (
+ owner TEXT NOT NULL, watch TEXT NOT NULL, epoch INTEGER NOT NULL,
+ cursor INTEGER NOT NULL DEFAULT 0, last_wake TEXT,
+ PRIMARY KEY(owner,watch), FOREIGN KEY(owner,watch) REFERENCES watches(owner,watch) ON DELETE CASCADE);
+CREATE TABLE IF NOT EXISTS recipient_sources (
+ owner TEXT NOT NULL, watch TEXT NOT NULL, recipient TEXT NOT NULL, source_id TEXT NOT NULL, created TEXT NOT NULL,
+ PRIMARY KEY(owner,recipient,source_id),
+ FOREIGN KEY(owner,watch) REFERENCES watches(owner,watch) ON DELETE CASCADE);
+CREATE TABLE IF NOT EXISTS reminder_rules (
+ owner TEXT NOT NULL, watch TEXT NOT NULL, obligation TEXT NOT NULL, epoch INTEGER NOT NULL,
+ version INTEGER NOT NULL, watermark INTEGER NOT NULL, due TEXT NOT NULL, fired INTEGER NOT NULL DEFAULT 0,
+ PRIMARY KEY(owner,watch,obligation), FOREIGN KEY(owner,watch) REFERENCES watches(owner,watch) ON DELETE CASCADE);
 PRAGMA user_version=1;
 """
 
@@ -1031,6 +1068,9 @@ class SQLiteStore:
                     data["state"],
                     data["summary"],
                     tuple(data["evidence"]),
+                    data.get("confidence", 1.0),
+                    data.get("due_at"),
+                    data.get("due_origin"),
                 )
                 for row in db.execute(
                     "SELECT * FROM obligations WHERE owner=? AND watch=? ORDER BY obligation",
@@ -1067,4 +1107,284 @@ class SQLiteStore:
             db.execute(
                 "DELETE FROM budget_buckets WHERE owner=? AND bucket<?", (owner_id, boundary)
             )
+            db.execute(
+                "DELETE FROM recipient_sources WHERE owner=? AND created<?", (owner_id, boundary)
+            )
+            db.execute(
+                "DELETE FROM policy_global_budgets WHERE owner=? AND bucket<?",
+                (owner_id, boundary),
+            )
             return sum(row["count"] for row in rows)
+
+    def policy_pending(self, owner, watch_id):
+        with self._transaction() as db:
+            watch = self._get(db, owner, watch_id)
+            if not watch or watch.state != WatchState.ACTIVE:
+                return None, (), None
+            row = db.execute(
+                "SELECT * FROM policy_progress WHERE owner=? AND watch=? AND epoch=?",
+                (owner, watch_id, watch.epoch),
+            ).fetchone()
+            cursor = row["cursor"] if row else 0
+            sources = tuple(
+                self._source(r)
+                for r in db.execute(
+                    "SELECT * FROM source_events WHERE owner=? AND watch=? AND epoch=? AND seq>? ORDER BY seq",
+                    (owner, watch_id, watch.epoch, cursor),
+                )
+            )
+            return (
+                watch,
+                sources,
+                datetime.fromisoformat(row["last_wake"]) if row and row["last_wake"] else None,
+            )
+
+    def dispatch_policy(
+        self, owner, watch_id, epoch, sequences, *, deliveries, now, watch_limit, account_limit
+    ):
+        """Atomically fence, budget, deduplicate, enqueue and advance the settled cursor."""
+        with self._transaction() as db:
+            watch = self._active(db, owner, watch_id, epoch)
+            current = db.execute(
+                "SELECT watermark FROM watches WHERE owner=? AND watch=?", (owner, watch_id)
+            ).fetchone()[0]
+            if not sequences or current != max(sequences):
+                return None
+            rows = db.execute(
+                "SELECT * FROM source_events WHERE owner=? AND watch=? AND epoch=? AND seq>? ORDER BY seq",
+                (owner, watch_id, epoch, min(sequences) - 1),
+            ).fetchall()
+            if tuple(r["seq"] for r in rows) != tuple(sequences):
+                return None
+            cursor = db.execute(
+                "SELECT cursor FROM policy_progress WHERE owner=? AND watch=? AND epoch=?",
+                (owner, watch_id, epoch),
+            ).fetchone()
+            if cursor and cursor[0] >= current:
+                return None
+            incoming = any(
+                not self._source(r).record.metadata.get("outgoing", False) for r in rows
+            )
+            requests = (
+                tuple(dict.fromkeys(deliveries))
+                if incoming and watch.active.policy.wake_dot
+                else ()
+            )
+            source_ids = {r["source_id"] for r in rows}
+            unseen_by_recipient = {}
+            for recipient in {r.recipient_id for r in requests}:
+                known = {
+                    r[0]
+                    for r in db.execute(
+                        "SELECT r.source_id FROM recipient_sources r JOIN source_events s ON r.owner=s.owner AND r.source_id=s.source_id WHERE s.owner=? AND s.watch=? AND s.epoch=? AND r.recipient=?",
+                        (owner, watch_id, epoch, recipient),
+                    )
+                }
+                unseen_by_recipient[recipient] = [r for r in rows if r["source_id"] not in known]
+            requests = tuple(r for r in requests if unseen_by_recipient[r.recipient_id])
+            if incoming and watch.active.policy.wake_dot and deliveries and not requests:
+                incoming = False
+            if incoming and watch.active.policy.wake_dot and not deliveries:
+                return None
+            bucket = _time(now.replace(minute=0, second=0, microsecond=0))
+            if requests:
+                used_row = db.execute(
+                    "SELECT used FROM policy_global_budgets WHERE owner=? AND bucket=?",
+                    (owner, bucket),
+                ).fetchone()
+                used = used_row[0] if used_row else 0
+                own = db.execute(
+                    "SELECT used FROM budget_buckets WHERE owner=? AND watch=? AND name='packet' AND bucket=?",
+                    (owner, watch_id, bucket),
+                ).fetchone()
+                if (
+                    used + len(requests) > account_limit
+                    or (own[0] if own else 0) + len(requests) > watch_limit
+                ):
+                    return None
+                if (
+                    db.execute(
+                        "SELECT COUNT(*) FROM recipient_sources WHERE owner=?", (owner,)
+                    ).fetchone()[0]
+                    + len(source_ids) * len(requests)
+                    > self.limits.max_deliveries
+                ):
+                    self._gap(db, owner, watch_id, "storage_limit")
+                    return None
+            event_id = None
+            if requests:
+                groups = {}
+                for request in requests:
+                    unseen = unseen_by_recipient[request.recipient_id]
+                    selected = unseen[-100:]
+                    payload = {
+                        "source_ids": [r["source_id"] for r in selected],
+                        "sequences": [r["seq"] for r in selected],
+                        "has_more": len(unseen) > 100,
+                    }
+                    batch_id = sha256(
+                        _json(
+                            (
+                                owner,
+                                watch_id,
+                                epoch,
+                                tuple(payload["sequences"]),
+                                payload["has_more"],
+                            )
+                        ).encode()
+                    ).hexdigest()
+                    groups.setdefault(batch_id, (payload, []))[1].append(request)
+                if not self._capacity(
+                    db,
+                    owner,
+                    watch_id,
+                    batches=len(groups),
+                    deliveries=len(set(requests)),
+                    size=sum(len(_json(payload).encode()) for payload, _ in groups.values()),
+                ):
+                    return None
+                budget_exists = db.execute(
+                    "SELECT 1 FROM budget_buckets WHERE owner=? AND watch=? AND name='packet' AND bucket=?",
+                    (owner, watch_id, bucket),
+                ).fetchone()
+                new_global = not db.execute(
+                    "SELECT 1 FROM policy_global_budgets WHERE owner=? AND bucket=?",
+                    (owner, bucket),
+                ).fetchone()
+                keys = (
+                    db.execute(
+                        "SELECT COUNT(*) FROM budget_buckets WHERE owner=?", (owner,)
+                    ).fetchone()[0]
+                    + db.execute(
+                        "SELECT COUNT(*) FROM policy_global_budgets WHERE owner=?", (owner,)
+                    ).fetchone()[0]
+                )
+                if keys + int(not budget_exists) + int(new_global) > self.limits.max_budget_keys:
+                    self._gap(db, owner, watch_id, "storage_limit")
+                    return None
+                for batch_id, (payload, group_requests) in groups.items():
+                    self._enqueue(
+                        db, owner, watch_id, epoch, batch_id, payload, group_requests, now
+                    )
+                    event_id = event_id or batch_id
+                db.execute(
+                    "INSERT INTO budget_buckets(owner,watch,name,bucket,used) VALUES(?,?,'packet',?,?) ON CONFLICT(owner,watch,name,bucket) DO UPDATE SET used=used+excluded.used",
+                    (owner, watch_id, bucket, len(requests)),
+                )
+                db.execute(
+                    "INSERT INTO policy_global_budgets(owner,bucket,used) VALUES(?,?,?) ON CONFLICT(owner,bucket) DO UPDATE SET used=used+excluded.used",
+                    (owner, bucket, len(requests)),
+                )
+                for request in requests:
+                    db.executemany(
+                        "INSERT OR IGNORE INTO recipient_sources(owner,watch,recipient,source_id,created) VALUES(?,?,?,?,?)",
+                        (
+                            (owner, watch_id, request.recipient_id, sid, _time(now))
+                            for sid in source_ids
+                        ),
+                    )
+            previous = db.execute(
+                "SELECT last_wake FROM policy_progress WHERE owner=? AND watch=? AND epoch=?",
+                (owner, watch_id, epoch),
+            ).fetchone()
+            last = _time(now) if requests else (previous[0] if previous else None)
+            db.execute(
+                "INSERT INTO policy_progress(owner,watch,epoch,cursor,last_wake) VALUES(?,?,?,?,?) ON CONFLICT(owner,watch) DO UPDATE SET epoch=excluded.epoch,cursor=excluded.cursor,last_wake=excluded.last_wake",
+                (owner, watch_id, epoch, current, last),
+            )
+            return event_id
+
+    def schedule_reminder(self, owner, watch_id, obligation_id, expected_version, due_at):
+        """Trusted control-plane operation: an explicit one-shot recheck, never implied by a watch."""
+        with self._transaction() as db:
+            watch = self._get(db, owner, watch_id)
+            if not watch:
+                raise ScopeDenied("Unknown watch")
+            self._active(db, owner, watch_id, watch.epoch)
+            if not watch.active.policy.store_state or not watch.active.policy.wake_dot:
+                raise ScopeDenied("Reminder rechecks require state and Dot permissions")
+            row = db.execute(
+                "SELECT version,document FROM obligations WHERE owner=? AND watch=? AND obligation=?",
+                (owner, watch_id, obligation_id),
+            ).fetchone()
+            if not row or row["version"] != expected_version:
+                raise ScopeDenied("Reminder requires the current obligation version")
+            if json.loads(row["document"])["state"] not in (
+                "awaiting_me",
+                "awaiting_them",
+                "snoozed",
+            ):
+                raise ValueError("Only open obligations can be rechecked")
+            watermark = db.execute(
+                "SELECT watermark FROM watches WHERE owner=? AND watch=?", (owner, watch_id)
+            ).fetchone()[0]
+            db.execute(
+                "INSERT INTO reminder_rules(owner,watch,obligation,epoch,version,watermark,due) VALUES(?,?,?,?,?,?,?) ON CONFLICT(owner,watch,obligation) DO UPDATE SET epoch=excluded.epoch,version=excluded.version,watermark=excluded.watermark,due=excluded.due,fired=0",
+                (
+                    owner,
+                    watch_id,
+                    obligation_id,
+                    watch.epoch,
+                    expected_version,
+                    watermark,
+                    _time(due_at),
+                ),
+            )
+
+    def due_reminders(self, owner, watch_id, *, now):
+        with self._transaction() as db:
+            watch = self._get(db, owner, watch_id)
+            if (
+                not watch
+                or watch.state != WatchState.ACTIVE
+                or not watch.active.policy.store_state
+                or not watch.active.policy.wake_dot
+            ):
+                return ()
+            watermark = db.execute(
+                "SELECT watermark FROM watches WHERE owner=? AND watch=?", (owner, watch_id)
+            ).fetchone()[0]
+            rows = db.execute(
+                "SELECT r.* FROM reminder_rules r JOIN obligations o ON r.owner=o.owner AND r.watch=o.watch AND r.obligation=o.obligation AND r.version=o.version WHERE r.owner=? AND r.watch=? AND r.epoch=? AND r.watermark=? AND r.due<=? AND r.fired=0 ORDER BY r.due LIMIT 100",
+                (owner, watch_id, watch.epoch, watermark, _time(now)),
+            ).fetchall()
+            return tuple(
+                (
+                    r["obligation"],
+                    r["due"],
+                    AnalysisSnapshot(
+                        owner, watch_id, watch.epoch, watermark, ((r["obligation"], r["version"]),)
+                    ),
+                )
+                for r in rows
+            )
+
+    def complete_reminder(self, snapshot, obligation_id, due_at):
+        """Consume only the exact recheck after its analysis was committed by the caller."""
+        with self._transaction() as db:
+            try:
+                self._active(db, snapshot.owner_id, snapshot.watch_id, snapshot.epoch)
+            except ScopeDenied:
+                return False
+            current = db.execute(
+                "SELECT watermark FROM watches WHERE owner=? AND watch=?",
+                (snapshot.owner_id, snapshot.watch_id),
+            ).fetchone()[0]
+            if current != snapshot.watermark:
+                return False
+            row = db.execute(
+                "SELECT version,watermark,due FROM reminder_rules WHERE owner=? AND watch=? AND obligation=? AND epoch=?",
+                (snapshot.owner_id, snapshot.watch_id, obligation_id, snapshot.epoch),
+            ).fetchone()
+            if (
+                not row
+                or row["due"] != due_at
+                or row["watermark"] != snapshot.watermark
+                or dict(snapshot.obligation_versions).get(obligation_id) != row["version"]
+            ):
+                return False
+            db.execute(
+                "UPDATE reminder_rules SET fired=1 WHERE owner=? AND watch=? AND obligation=?",
+                (snapshot.owner_id, snapshot.watch_id, obligation_id),
+            )
+            return True
