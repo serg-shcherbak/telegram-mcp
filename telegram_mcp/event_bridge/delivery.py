@@ -1,23 +1,11 @@
-"""Leased outbox delivery; a receipt never commits analysis."""
-
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from email.utils import parsedate_to_datetime
 
 from .callbacks import CallbackError, encode_body, signed_headers
 from .policies import PolicyScheduler, ReminderPolicy
-from .protocol import ACTIVITY, ATTENTION, HEALTH, canonical
-from .store import DeliveryRequest
+from .protocol import ATTENTION, HEALTH, canonical
+from .store import DeliveryRequest, _plain as plain
 from hashlib import sha256
-
-
-def plain(value):
-    from collections.abc import Mapping
-
-    if isinstance(value, Mapping):
-        return {k: plain(v) for k, v in value.items()}
-    if isinstance(value, (tuple, list)):
-        return [plain(v) for v in value]
-    return value
 
 
 class DeliveryWorker:
@@ -43,7 +31,6 @@ class DeliveryWorker:
                     for g in grants
                     if g["name"] == ATTENTION
                 )
-                # This event requests a fresh analysis. It is not an assertion of an overdue obligation.
                 self.store.dispatch_control(
                     self.owner_id,
                     watch.watch_id,
@@ -87,7 +74,6 @@ class DeliveryWorker:
                 or grant["epoch"] != delivery.epoch
                 or grant["recipient"] != delivery.recipient_id
             ):
-                # Revoking or expiring a grant cancels its pending queue before network I/O.
                 self.store.retry(
                     self.owner_id,
                     delivery.delivery_id,

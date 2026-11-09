@@ -1,5 +1,3 @@
-"""Opaque, bounded, persistent analysis authority; Telegram text stays ephemeral."""
-
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 import json
@@ -143,7 +141,6 @@ class AnalysisCoordinator:
             if row["receipt"]:
                 return self._receipt(db, row)
             data = json.loads(row["document"])
-        # Fresh fetch immediately before the CAS; a failed/gapped read cannot commit.
         context = await self.reader.read(row["watch"], data["sources"])
         if any(m.gap or m.truncated for m in context.messages):
             from dataclasses import replace

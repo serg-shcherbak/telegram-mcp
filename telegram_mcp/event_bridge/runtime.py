@@ -1,5 +1,3 @@
-"""Opt-in authenticated composition around the existing Telegram session."""
-
 import asyncio
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
@@ -321,10 +319,8 @@ def configure(manual_mcp, client, *, env=None):
     from .context import ContextProfile, ScopedContextReader
     from .protocol import EventPrincipal
     from telegram_mcp.transport.http import install_events_adapter
-    from .store import SQLiteStore
 
     owner = env.get("DOT_EXPECTED_USER_ID", "")
-    # Auth errors fail closed, independently of optional event storage availability.
     profiles = load_profiles(env["DOT_EVENTS_PROFILES_FILE"], owner)
     runtime = _open_runtime(env, owner, profiles, client)
     service, store = (runtime.service, runtime.store) if runtime else (None, None)
