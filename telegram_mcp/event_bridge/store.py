@@ -380,6 +380,10 @@ CREATE TABLE IF NOT EXISTS event_frontiers (
 CREATE TABLE IF NOT EXISTS event_history (
  seq INTEGER PRIMARY KEY AUTOINCREMENT, owner TEXT NOT NULL, event_id TEXT NOT NULL,
  UNIQUE(owner,event_id), FOREIGN KEY(owner,event_id) REFERENCES delivery_batches(owner,event_id) ON DELETE CASCADE);
+CREATE TABLE IF NOT EXISTS analysis_jobs (
+ job TEXT PRIMARY KEY, owner TEXT NOT NULL, profile TEXT NOT NULL, watch TEXT NOT NULL,
+ expires TEXT NOT NULL, document TEXT NOT NULL, receipt TEXT,
+ FOREIGN KEY(owner,watch) REFERENCES watches(owner,watch) ON DELETE CASCADE);
 PRAGMA user_version=1;
 """
 
@@ -414,16 +418,20 @@ class SQLiteStore:
         self._lock = RLock()
         self._volatile = {}
         self._db = sqlite3.connect(str(path), isolation_level=None, check_same_thread=False)
-        self._db.row_factory = sqlite3.Row
-        self._db.execute("PRAGMA foreign_keys=ON")
-        self._db.execute("PRAGMA busy_timeout=5000")
-        self._db.execute("PRAGMA journal_mode=DELETE")
-        self._db.execute("PRAGMA synchronous=FULL")
-        version = self._db.execute("PRAGMA user_version").fetchone()[0]
-        if version not in (0, 1):
+        try:
+            self._db.row_factory = sqlite3.Row
+            self._db.execute("PRAGMA foreign_keys=ON")
+            self._db.execute("PRAGMA busy_timeout=5000")
+            self._db.execute("PRAGMA journal_mode=DELETE")
+            self._db.execute("PRAGMA synchronous=FULL")
+            version = self._db.execute("PRAGMA user_version").fetchone()[0]
+            if version not in (0, 1):
+                self._db.close()
+                raise ValueError("Unsupported event database schema")
+            self._db.executescript(_SCHEMA)
+        except BaseException:
             self._db.close()
-            raise ValueError("Unsupported event database schema")
-        self._db.executescript(_SCHEMA)
+            raise
 
     @property
     def journal_mode(self):
@@ -1052,61 +1060,61 @@ class SQLiteStore:
         ):
             raise ValueError("All changed obligations must be pinned once in the snapshot")
         with self._transaction() as db:
-            try:
-                watch = self._active(db, snapshot.owner_id, snapshot.watch_id, snapshot.epoch)
-            except ScopeDenied:
-                return False
-            if not watch.active.policy.store_state:
-                raise ScopeDenied("State persistence is not enabled")
-            watermark = db.execute(
-                "SELECT watermark FROM watches WHERE owner=? AND watch=?",
-                (snapshot.owner_id, snapshot.watch_id),
-            ).fetchone()[0]
-            if watermark != snapshot.watermark:
-                return False
-            versions = self._obligation_versions(
-                db, snapshot.owner_id, snapshot.watch_id, expected
+            return self._commit_analysis(db, snapshot, changes)
+
+    def _commit_analysis(self, db, snapshot, changes):
+        expected = dict(snapshot.obligation_versions)
+        try:
+            watch = self._active(db, snapshot.owner_id, snapshot.watch_id, snapshot.epoch)
+        except ScopeDenied:
+            return False
+        if not watch.active.policy.store_state:
+            raise ScopeDenied("State persistence is not enabled")
+        watermark = db.execute(
+            "SELECT watermark FROM watches WHERE owner=? AND watch=?",
+            (snapshot.owner_id, snapshot.watch_id),
+        ).fetchone()[0]
+        if watermark != snapshot.watermark:
+            return False
+        versions = self._obligation_versions(db, snapshot.owner_id, snapshot.watch_id, expected)
+        if any(versions.get(obligation, 0) != version for obligation, version in expected.items()):
+            return False
+        evidence = tuple({seq for change in changes for seq in change.evidence})
+        found = set()
+        for offset in range(0, len(evidence), 500):
+            chunk = evidence[offset : offset + 500]
+            found.update(
+                row[0]
+                for row in db.execute(
+                    "SELECT seq FROM source_events WHERE owner=? AND watch=? AND epoch=? AND seq IN ("
+                    + ",".join("?" for _ in chunk)
+                    + ")",
+                    (snapshot.owner_id, snapshot.watch_id, snapshot.epoch, *chunk),
+                )
             )
-            if any(
-                versions.get(obligation, 0) != version for obligation, version in expected.items()
-            ):
-                return False
-            evidence = tuple({seq for change in changes for seq in change.evidence})
-            found = set()
-            for offset in range(0, len(evidence), 500):
-                chunk = evidence[offset : offset + 500]
-                found.update(
-                    row[0]
-                    for row in db.execute(
-                        "SELECT seq FROM source_events WHERE owner=? AND watch=? AND epoch=? AND seq IN ("
-                        + ",".join("?" for _ in chunk)
-                        + ")",
-                        (snapshot.owner_id, snapshot.watch_id, snapshot.epoch, *chunk),
-                    )
-                )
-            if len(found) != len(evidence):
-                raise ScopeDenied("Evidence must belong to this active watch epoch")
-            documents = [_json(asdict(c)) for c in changes]
-            if not self._capacity(
-                db,
-                snapshot.owner_id,
-                snapshot.watch_id,
-                obligations=sum(expected[c.obligation_id] == 0 for c in changes),
-                size=sum(len(v.encode()) for v in documents),
-            ):
-                return False
-            for change, document in zip(changes, documents):
-                db.execute(
-                    "INSERT INTO obligations(owner,watch,obligation,version,document) VALUES(?,?,?,?,?) ON CONFLICT(owner,watch,obligation) DO UPDATE SET version=excluded.version,document=excluded.document",
-                    (
-                        snapshot.owner_id,
-                        snapshot.watch_id,
-                        change.obligation_id,
-                        expected[change.obligation_id] + 1,
-                        document,
-                    ),
-                )
-            return True
+        if len(found) != len(evidence):
+            raise ScopeDenied("Evidence must belong to this active watch epoch")
+        documents = [_json(asdict(c)) for c in changes]
+        if not self._capacity(
+            db,
+            snapshot.owner_id,
+            snapshot.watch_id,
+            obligations=sum(expected[c.obligation_id] == 0 for c in changes),
+            size=sum(len(v.encode()) for v in documents),
+        ):
+            return False
+        for change, document in zip(changes, documents):
+            db.execute(
+                "INSERT INTO obligations(owner,watch,obligation,version,document) VALUES(?,?,?,?,?) ON CONFLICT(owner,watch,obligation) DO UPDATE SET version=excluded.version,document=excluded.document",
+                (
+                    snapshot.owner_id,
+                    snapshot.watch_id,
+                    change.obligation_id,
+                    expected[change.obligation_id] + 1,
+                    document,
+                ),
+            )
+        return True
 
     def get_obligations(self, owner_id, watch_id):
         with self._transaction() as db:

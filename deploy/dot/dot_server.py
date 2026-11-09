@@ -8,6 +8,10 @@ from typing import Optional
 def prepare():
     os.environ.setdefault("TELEGRAM_LEGACY_EVENTS", "0")
     os.environ.setdefault("TELEGRAM_WARM_ENTITY_CACHE", "0")
+    if os.environ.get("DOT_EVENTS_ENABLED", "0") == "1":
+        os.environ.setdefault("TELEGRAM_EVENT_LOG_SIZE", "0")
+        if os.environ["TELEGRAM_EVENT_LOG_SIZE"] != "0":
+            raise SystemExit("Legacy event log must be disabled")
     uid = os.environ.get("DOT_EXPECTED_USER_ID", "")
     if not uid.isdigit() or int(uid) <= 0:
         raise SystemExit("Missing verified numeric account ID")
@@ -129,6 +133,27 @@ def prepare():
         await original(label, client)
 
     runner._verify_expected_username = verify
+    if os.environ.get("DOT_EVENTS_ENABLED", "0") == "1":
+
+        async def serve(transport):
+            if transport != "http" or len(runtime.clients) != 1:
+                raise RuntimeError("Events require one verified client and HTTP")
+            from telegram_mcp.event_bridge.runtime import configure
+            import uvicorn
+
+            runtime.mcp.settings.host = os.getenv("MCP_HOST", "127.0.0.1")
+            runtime.mcp.settings.port = int(os.getenv("MCP_PORT", "8765"))
+            runner._configure_transport_security()
+            app = configure(runtime.mcp, next(iter(runtime.clients.values())))
+            config = uvicorn.Config(
+                app,
+                host=os.getenv("MCP_HOST", "127.0.0.1"),
+                port=int(os.getenv("MCP_PORT", "8765")),
+                log_level="warning",
+            )
+            await uvicorn.Server(config).serve()
+
+        runner._serve = serve
     return runner
 
 

@@ -1,0 +1,22 @@
+# Explicit opt-in overlay. Prepare private paths before composing; no keys generated.
+services:
+  telegram-mcp:
+    environment:
+      DOT_EVENTS_ENABLED: '1'
+      DOT_EVENTS_DB: /app/state/events/events.sqlite
+      DOT_EVENTS_KEY_FILE: /run/events/master.key
+      DOT_EVENTS_PROFILES_FILE: /run/events/profiles.json
+      DOT_EVENTS_DELIVERY_ENABLED: '0'
+      DOT_EVENTS_CONTEXT_VERIFIED: '0'
+      TELEGRAM_EVENT_LOG_SIZE: '0'
+    volumes:
+      - type: bind
+        source: /etc/telegram-dot/events/master.key
+        target: /run/events/master.key
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: /etc/telegram-dot/events/profiles.json
+        target: /run/events/profiles.json
+        read_only: true
+        bind: {create_host_path: false}
