@@ -203,3 +203,16 @@ async def run_streamable_http_async(mcp_instance: Any) -> None:
     )
     server = uvicorn.Server(config)
     await server.serve()
+
+
+def install_events_adapter(
+    app: Any, service: Any, *, principal_resolver: Any, mcp_path: str = "/mcp"
+) -> Any:
+    """Install outside discovery, using the same trusted auth resolver as tools.
+
+    The resolver returns event_bridge.protocol.EventPrincipal or None. A restricted
+    context token supplies a frozen watch allowlist. Do not install when disabled.
+    """
+    from telegram_mcp.event_bridge.protocol import EventsMiddleware
+
+    return EventsMiddleware(app, service, principal_resolver=principal_resolver, mcp_path=mcp_path)

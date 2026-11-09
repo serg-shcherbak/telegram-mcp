@@ -365,6 +365,21 @@ CREATE TABLE IF NOT EXISTS reminder_rules (
  owner TEXT NOT NULL, watch TEXT NOT NULL, obligation TEXT NOT NULL, epoch INTEGER NOT NULL,
  version INTEGER NOT NULL, watermark INTEGER NOT NULL, due TEXT NOT NULL, fired INTEGER NOT NULL DEFAULT 0,
  PRIMARY KEY(owner,watch,obligation), FOREIGN KEY(owner,watch) REFERENCES watches(owner,watch) ON DELETE CASCADE);
+CREATE TABLE IF NOT EXISTS event_subscriptions (
+ owner TEXT NOT NULL, identity TEXT NOT NULL, subscription TEXT NOT NULL, watch TEXT NOT NULL,
+ epoch INTEGER NOT NULL, expires TEXT NOT NULL, document BLOB NOT NULL,
+ PRIMARY KEY(owner,identity), UNIQUE(owner,subscription),
+ FOREIGN KEY(owner,watch) REFERENCES watches(owner,watch) ON DELETE CASCADE);
+CREATE TABLE IF NOT EXISTS event_replays (
+ owner TEXT NOT NULL, subscription TEXT NOT NULL, event_id TEXT NOT NULL,
+ PRIMARY KEY(owner,subscription,event_id),
+ FOREIGN KEY(owner,event_id) REFERENCES delivery_batches(owner,event_id) ON DELETE CASCADE);
+CREATE TABLE IF NOT EXISTS event_frontiers (
+ owner TEXT NOT NULL, subscription TEXT NOT NULL, position INTEGER NOT NULL DEFAULT 0,
+ floor INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(owner,subscription));
+CREATE TABLE IF NOT EXISTS event_history (
+ seq INTEGER PRIMARY KEY AUTOINCREMENT, owner TEXT NOT NULL, event_id TEXT NOT NULL,
+ UNIQUE(owner,event_id), FOREIGN KEY(owner,event_id) REFERENCES delivery_batches(owner,event_id) ON DELETE CASCADE);
 PRAGMA user_version=1;
 """
 
@@ -507,6 +522,23 @@ class SQLiteStore:
                 "INSERT OR IGNORE INTO health(owner,watch) VALUES(?,?)", (owner_id, watch_id)
             )
             if current is not None and current.epoch != replacement.epoch:
+                stale = db.execute(
+                    "SELECT subscription FROM event_subscriptions WHERE owner=? AND watch=? AND epoch!=?",
+                    (owner_id, watch_id, replacement.epoch),
+                ).fetchall()
+                for grant in stale:
+                    db.execute(
+                        "DELETE FROM event_frontiers WHERE owner=? AND subscription=?",
+                        (owner_id, grant["subscription"]),
+                    )
+                    db.execute(
+                        "DELETE FROM event_replays WHERE owner=? AND subscription=?",
+                        (owner_id, grant["subscription"]),
+                    )
+                db.execute(
+                    "DELETE FROM event_subscriptions WHERE owner=? AND watch=? AND epoch!=?",
+                    (owner_id, watch_id, replacement.epoch),
+                )
                 db.execute(
                     "UPDATE deliveries SET state='cancelled',token=NULL,lease_until=NULL WHERE owner=? AND state IN ('pending','sending') AND event_id IN (SELECT event_id FROM delivery_batches WHERE owner=? AND watch=? AND epoch!=?)",
                     (owner_id, owner_id, watch_id, replacement.epoch),
@@ -756,6 +788,9 @@ class SQLiteStore:
             "INSERT OR IGNORE INTO delivery_batches(owner,watch,epoch,event_id,created,document) VALUES(?,?,?,?,?,?)",
             (owner, watch, epoch, event_id, _time(now), _json(payload)),
         )
+        db.execute(
+            "INSERT OR IGNORE INTO event_history(owner,event_id) VALUES(?,?)", (owner, event_id)
+        )
         for request in set(requests):
             delivery_id = sha256(
                 _json((owner, request.recipient_id, request.subscription_id, event_id)).encode()
@@ -917,6 +952,20 @@ class SQLiteStore:
             db.execute(
                 "UPDATE deliveries SET state='acked',token=NULL,lease_until=NULL WHERE owner=? AND delivery_id=?",
                 (owner_id, delivery_id),
+            )
+            row = self._delivery_row(db, owner_id, delivery_id)
+            receipts = db.execute(
+                "SELECT h.seq,d.state FROM event_history h JOIN deliveries d ON d.owner=h.owner AND d.event_id=h.event_id WHERE d.owner=? AND d.subscription=? ORDER BY h.seq",
+                (owner_id, row["subscription"]),
+            ).fetchall()
+            position = 0
+            for receipt in receipts:
+                if receipt["state"] != "acked":
+                    break
+                position = receipt["seq"]
+            db.execute(
+                "INSERT INTO event_frontiers(owner,subscription,position) VALUES(?,?,?) ON CONFLICT(owner,subscription) DO UPDATE SET position=MAX(position,excluded.position)",
+                (owner_id, row["subscription"], position),
             )
             return True
 
@@ -1098,6 +1147,19 @@ class SQLiteStore:
                 )
             for row in rows:
                 self._gap(db, owner_id, row["watch"], "retention_expired")
+            db.execute(
+                "DELETE FROM event_frontiers WHERE owner=? AND subscription NOT IN (SELECT subscription FROM event_subscriptions WHERE owner=?)",
+                (owner_id, owner_id),
+            )
+            expired = db.execute(
+                "SELECT d.subscription,MAX(h.seq) AS floor FROM delivery_batches b JOIN deliveries d ON d.owner=b.owner AND d.event_id=b.event_id JOIN event_history h ON h.owner=b.owner AND h.event_id=b.event_id WHERE b.owner=? AND b.created<? AND EXISTS(SELECT 1 FROM event_subscriptions s WHERE s.owner=d.owner AND s.subscription=d.subscription) GROUP BY d.subscription",
+                (owner_id, boundary),
+            ).fetchall()
+            for item in expired:
+                db.execute(
+                    "INSERT INTO event_frontiers(owner,subscription,floor) VALUES(?,?,?) ON CONFLICT(owner,subscription) DO UPDATE SET floor=MAX(floor,excluded.floor)",
+                    (owner_id, item["subscription"], item["floor"]),
+                )
             db.execute(
                 "DELETE FROM delivery_batches WHERE owner=? AND created<?", (owner_id, boundary)
             )
@@ -1376,3 +1438,314 @@ class SQLiteStore:
                 (snapshot.owner_id, snapshot.watch_id, obligation_id),
             )
             return True
+
+    def subscription_rows(self, owner, watch_id=None):
+        with self._transaction() as db:
+            return tuple(
+                dict(r)
+                for r in db.execute(
+                    "SELECT * FROM event_subscriptions WHERE owner=?"
+                    + (" AND watch=?" if watch_id else ""),
+                    (owner, watch_id) if watch_id else (owner,),
+                )
+            )
+
+    def save_subscription(self, owner, identity, subscription, watch_id, epoch, expires, document):
+        with self._transaction() as db:
+            self._active(db, owner, watch_id, epoch)
+            db.execute(
+                "DELETE FROM event_frontiers WHERE owner=? AND subscription NOT IN (SELECT subscription FROM event_subscriptions WHERE owner=?)",
+                (owner, owner),
+            )
+            existing = db.execute(
+                "SELECT 1 FROM event_subscriptions WHERE owner=? AND identity=?", (owner, identity)
+            ).fetchone()
+            if (
+                not existing
+                and db.execute(
+                    "SELECT COUNT(*) FROM event_subscriptions WHERE owner=?", (owner,)
+                ).fetchone()[0]
+                >= 20
+            ):
+                raise ValueError("Subscription ceiling reached")
+            db.execute(
+                "INSERT INTO event_subscriptions VALUES(?,?,?,?,?,?,?) ON CONFLICT(owner,identity) DO UPDATE SET subscription=excluded.subscription,epoch=excluded.epoch,expires=excluded.expires,document=excluded.document",
+                (owner, identity, subscription, watch_id, epoch, _time(expires), document),
+            )
+
+    def remove_subscription(self, owner, identity, *, now):
+        from dataclasses import replace
+
+        with self._transaction() as db:
+            row = db.execute(
+                "SELECT * FROM event_subscriptions WHERE owner=? AND identity=?", (owner, identity)
+            ).fetchone()
+            if not row:
+                return
+            db.execute(
+                "UPDATE deliveries SET state='cancelled',token=NULL,lease_until=NULL WHERE owner=? AND subscription=? AND state IN ('pending','sending')",
+                (owner, row["subscription"]),
+            )
+            db.execute(
+                "DELETE FROM event_subscriptions WHERE owner=? AND identity=?", (owner, identity)
+            )
+            db.execute(
+                "DELETE FROM event_frontiers WHERE owner=? AND subscription=?",
+                (owner, row["subscription"]),
+            )
+            db.execute(
+                "DELETE FROM event_replays WHERE owner=? AND subscription=?",
+                (owner, row["subscription"]),
+            )
+            watch = self._get(db, owner, row["watch"])
+            remaining = db.execute(
+                "SELECT 1 FROM event_subscriptions WHERE owner=? AND watch=? AND epoch=? AND expires>?",
+                (owner, row["watch"], row["epoch"], _time(now)),
+            ).fetchone()
+            if (
+                watch
+                and watch.state == WatchState.ACTIVE
+                and watch.epoch == row["epoch"]
+                and not remaining
+                and not watch.active.policy.store_state
+            ):
+                paused = replace(
+                    watch,
+                    version=watch.version + 1,
+                    epoch=watch.epoch + 1,
+                    state=WatchState.PAUSED,
+                )
+                db.execute(
+                    "UPDATE watches SET version=?,epoch=?,document=? WHERE owner=? AND watch=?",
+                    (paused.version, paused.epoch, _watch_document(paused), owner, watch.watch_id),
+                )
+                db.execute(
+                    "UPDATE deliveries SET state='cancelled',token=NULL,lease_until=NULL WHERE owner=? AND state IN ('pending','sending') AND event_id IN (SELECT event_id FROM delivery_batches WHERE owner=? AND watch=?)",
+                    (owner, owner, watch.watch_id),
+                )
+
+    def event_position(self, owner, subscription):
+        """Receipt frontier never moves beyond an unacknowledged retained delivery."""
+        with self._transaction() as db:
+            rows = db.execute(
+                "SELECT h.seq,d.state FROM event_history h JOIN deliveries d ON d.owner=h.owner AND d.event_id=h.event_id WHERE d.owner=? AND d.subscription=? ORDER BY h.seq",
+                (owner, subscription),
+            ).fetchall()
+            saved = db.execute(
+                "SELECT position FROM event_frontiers WHERE owner=? AND subscription=?",
+                (owner, subscription),
+            ).fetchone()
+            position = saved[0] if saved else 0
+            for row in rows:
+                if row["state"] != "acked":
+                    return min(position, row["seq"] - 1)
+                position = max(position, row["seq"])
+            return position
+
+    def event_metadata(self, owner, event_id):
+        with self._transaction() as db:
+            row = db.execute(
+                "SELECT b.created,h.seq FROM delivery_batches b JOIN event_history h ON h.owner=b.owner AND h.event_id=b.event_id WHERE b.owner=? AND b.event_id=?",
+                (owner, event_id),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def replay_events(self, owner, subscription, after):
+        with self._transaction() as db:
+            rows = db.execute(
+                "SELECT h.seq,d.event_id,d.state FROM event_history h JOIN deliveries d ON d.owner=h.owner AND d.event_id=h.event_id WHERE d.owner=? AND d.subscription=? ORDER BY h.seq LIMIT 1001",
+                (owner, subscription),
+            ).fetchall()
+            selected = tuple(dict(r) for r in rows if r["seq"] > after)
+            return selected[:100], len(selected) > 100
+
+    def request_replay(self, owner, subscription, after, *, now):
+        """Stage bounded retained receipts; actual repeat POSTs share packet budgets."""
+        with self._transaction() as db:
+            rows = db.execute(
+                "SELECT h.seq,d.event_id FROM event_history h JOIN deliveries d ON d.owner=h.owner AND d.event_id=h.event_id WHERE d.owner=? AND d.subscription=? ORDER BY h.seq",
+                (owner, subscription),
+            ).fetchall()
+            saved = db.execute(
+                "SELECT floor FROM event_frontiers WHERE owner=? AND subscription=?",
+                (owner, subscription),
+            ).fetchone()
+            floor = saved[0] if saved else 0
+            selected = [r for r in rows if r["seq"] > after]
+            for row in selected[:100]:
+                db.execute(
+                    "INSERT OR IGNORE INTO event_replays VALUES(?,?,?)",
+                    (owner, subscription, row["event_id"]),
+                )
+            return bool((floor and after <= floor) or len(selected) > 100)
+
+    def _packet_gate(self, db, owner, watch, requests, now):
+        from .policies import _quiet
+
+        policy = watch.active.policy
+        if not policy.wake_dot or _quiet(policy, now):
+            return False
+        progress = db.execute(
+            "SELECT last_wake FROM policy_progress WHERE owner=? AND watch=? AND epoch=?",
+            (owner, watch.watch_id, watch.epoch),
+        ).fetchone()
+        if (
+            progress
+            and progress[0]
+            and (now - datetime.fromisoformat(progress[0])).total_seconds()
+            < policy.min_wake_seconds
+        ):
+            return False
+        bucket = _time(now.replace(minute=0, second=0, microsecond=0))
+        own = db.execute(
+            "SELECT used FROM budget_buckets WHERE owner=? AND watch=? AND name='packet' AND bucket=?",
+            (owner, watch.watch_id, bucket),
+        ).fetchone()
+        total = db.execute(
+            "SELECT used FROM policy_global_budgets WHERE owner=? AND bucket=?", (owner, bucket)
+        ).fetchone()
+        count = len(set(requests))
+        if (own[0] if own else 0) + count > min(
+            policy.wakes_per_hour, policy.notifications_per_hour
+        ) or (total[0] if total else 0) + count > min(
+            policy.account_wakes_per_hour, policy.account_notifications_per_hour
+        ):
+            return False
+        keys = (
+            db.execute("SELECT COUNT(*) FROM budget_buckets WHERE owner=?", (owner,)).fetchone()[0]
+            + db.execute(
+                "SELECT COUNT(*) FROM policy_global_budgets WHERE owner=?", (owner,)
+            ).fetchone()[0]
+        )
+        if keys + int(own is None) + int(total is None) > self.limits.max_budget_keys:
+            return False
+        db.execute(
+            "INSERT INTO budget_buckets(owner,watch,name,bucket,used) VALUES(?,?,'packet',?,?) ON CONFLICT(owner,watch,name,bucket) DO UPDATE SET used=used+excluded.used",
+            (owner, watch.watch_id, bucket, count),
+        )
+        db.execute(
+            "INSERT INTO policy_global_budgets VALUES(?,?,?) ON CONFLICT(owner,bucket) DO UPDATE SET used=used+excluded.used",
+            (owner, bucket, count),
+        )
+        db.execute(
+            "INSERT INTO policy_progress(owner,watch,epoch,cursor,last_wake) VALUES(?,?,?,0,?) ON CONFLICT(owner,watch) DO UPDATE SET epoch=excluded.epoch,last_wake=excluded.last_wake",
+            (owner, watch.watch_id, watch.epoch, _time(now)),
+        )
+        return True
+
+    def dispatch_control(self, owner, watch_id, epoch, event_id, payload, deliveries, *, now):
+        with self._transaction() as db:
+            watch = self._active(db, owner, watch_id, epoch)
+            requests = tuple(set(deliveries))
+            if (
+                not requests
+                or db.execute(
+                    "SELECT 1 FROM delivery_batches WHERE owner=? AND event_id=?",
+                    (owner, event_id),
+                ).fetchone()
+            ):
+                return None
+            if not self._capacity(
+                db,
+                owner,
+                watch_id,
+                batches=1,
+                deliveries=len(requests),
+                size=len(_json(payload).encode()),
+            ):
+                return None
+            if not self._packet_gate(db, owner, watch, requests, now):
+                return None
+            self._enqueue(db, owner, watch_id, epoch, event_id, payload, requests, now)
+            return event_id
+
+    def dispatch_replays(self, owner, subscription, *, now):
+        with self._transaction() as db:
+            exists = db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='event_replays'"
+            ).fetchone()
+            if not exists:
+                return
+            rows = db.execute(
+                "SELECT d.*,b.watch,b.epoch FROM event_replays r JOIN deliveries d ON d.owner=r.owner AND d.subscription=r.subscription AND d.event_id=r.event_id JOIN delivery_batches b ON b.owner=d.owner AND b.event_id=d.event_id WHERE r.owner=? AND r.subscription=? ORDER BY d.due LIMIT 100",
+                (owner, subscription),
+            ).fetchall()
+            for row in rows:
+                try:
+                    watch = self._active(db, owner, row["watch"], row["epoch"])
+                except ScopeDenied:
+                    db.execute(
+                        "DELETE FROM event_replays WHERE owner=? AND subscription=? AND event_id=?",
+                        (owner, subscription, row["event_id"]),
+                    )
+                    continue
+                if row["state"] == "acked":
+                    if not self._packet_gate(
+                        db, owner, watch, (DeliveryRequest(row["recipient"], subscription),), now
+                    ):
+                        return
+                    db.execute(
+                        "UPDATE deliveries SET state='pending',attempts=0,due=?,token=NULL,lease_until=NULL WHERE delivery_id=?",
+                        (_time(now), row["delivery_id"]),
+                    )
+                db.execute(
+                    "DELETE FROM event_replays WHERE owner=? AND subscription=? AND event_id=?",
+                    (owner, subscription, row["event_id"]),
+                )
+
+    def record_attempt_receipt(self, owner, delivery_id, *, now, category):
+        """Bounded operational receipt even if revocation invalidates the claim token."""
+        if category not in (
+            "accepted",
+            "http_4xx",
+            "http_5xx",
+            "timeout",
+            "tls_error",
+            "connection_refused",
+            "challenge_failed",
+        ):
+            raise ValueError("Safe receipt category required")
+        with self._transaction() as db:
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS event_attempt_receipts(owner TEXT NOT NULL, delivery TEXT NOT NULL, occurred TEXT NOT NULL, category TEXT NOT NULL, PRIMARY KEY(owner,delivery))"
+            )
+            db.execute(
+                "INSERT INTO event_attempt_receipts VALUES(?,?,?,?) ON CONFLICT(owner,delivery) DO UPDATE SET occurred=excluded.occurred,category=excluded.category",
+                (owner, delivery_id, _time(now), category),
+            )
+            if category != "accepted":
+                delivery = self._delivery_row(db, owner, delivery_id)
+                watch = self._get(db, owner, delivery["watch"]) if delivery else None
+                if watch and watch.state == WatchState.ACTIVE and watch.epoch == delivery["epoch"]:
+                    reason = "callback_" + category
+                    previous = db.execute(
+                        "SELECT reason FROM health WHERE owner=? AND watch=?",
+                        (owner, watch.watch_id),
+                    ).fetchone()
+                    if previous and previous[0] != reason:
+                        self._gap(db, owner, watch.watch_id, reason)
+            db.execute(
+                "DELETE FROM event_attempt_receipts WHERE owner=? AND delivery NOT IN (SELECT delivery_id FROM deliveries WHERE owner=?)",
+                (owner, owner),
+            )
+
+    def reserve_delivery_retry(self, owner, delivery_id, token, *, now):
+        """Retry attempts consume actual POST capacity, sharing quiet/minimum-wake gates."""
+        from datetime import timedelta
+
+        with self._transaction() as db:
+            if not self._current_delivery(db, owner, delivery_id, token):
+                return False
+            row = self._delivery_row(db, owner, delivery_id)
+            if row["attempts"] <= 1:
+                return True  # First attempt was reserved atomically at publication.
+            watch = self._active(db, owner, row["watch"], row["epoch"])
+            if self._packet_gate(
+                db, owner, watch, (DeliveryRequest(row["recipient"], row["subscription"]),), now
+            ):
+                return True
+            db.execute(
+                "UPDATE deliveries SET state='pending',attempts=attempts-1,due=?,token=NULL,lease_until=NULL WHERE delivery_id=?",
+                (_time(now + timedelta(seconds=60)), delivery_id),
+            )
+            return False
