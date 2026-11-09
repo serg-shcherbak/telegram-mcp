@@ -261,7 +261,8 @@ async def _main() -> None:
             except Exception as warm_exc:
                 print(f"Entity cache warm failed: {warm_exc}", file=sys.stderr)
 
-        asyncio.create_task(_warm_caches())
+        if _runtime._parse_bool_env(os.getenv("TELEGRAM_WARM_ENTITY_CACHE"), True):
+            asyncio.create_task(_warm_caches())
 
         transport = os.getenv("MCP_TRANSPORT", "stdio").lower()
 

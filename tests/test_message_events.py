@@ -686,3 +686,24 @@ async def test_event_of_a_chat_that_is_no_forum_has_no_topic():
 
     (rec,) = events._event_log
     assert "topic" not in events._public_event(rec)
+
+
+@pytest.mark.asyncio
+async def test_legacy_producers_can_be_disabled_before_enrichment(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_LEGACY_EVENTS", "0")
+    e = _event(chat_id=42, private=True)
+    e.get_sender = AsyncMock(side_effect=AssertionError("enrichment forbidden"))
+    await events._on_new_incoming(e)
+    await events._on_message_event(e)
+    assert events._pending_msgs == {}
+    assert list(events._event_log) == []
+
+
+def test_disabled_legacy_handlers_do_not_register(monkeypatch):
+    from unittest.mock import Mock
+
+    cl = Mock()
+    monkeypatch.setattr(events, "clients", {"one": cl})
+    monkeypatch.setenv("TELEGRAM_LEGACY_EVENTS", "0")
+    events.register_incoming_handlers()
+    cl.add_event_handler.assert_not_called()
