@@ -167,7 +167,9 @@ class WatchPreview:
     capabilities: Tuple[Capability, ...]
     added_targets: Tuple[ScopeTarget, ...]
     removed_targets: Tuple[ScopeTarget, ...]
-    persisted_changes: Tuple[str, ...]
+    tracked_state_changes: Tuple[str, ...]
     dot_batches: Tuple[str, ...]
     potential_notifications: Tuple[str, ...]
+    # Minimal source/delivery metadata is separate from obligation tracking.
+    source_metadata_retained: bool = True
     start_boundary: str = "activation time; new events only"

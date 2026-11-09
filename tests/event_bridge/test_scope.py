@@ -170,7 +170,8 @@ def test_new_watch_is_only_a_draft_and_preview_has_no_side_effects(controls):
     before = dict(repository.rows)
     preview = manager.preview(draft.watch_id, expected_revision=1)
     assert preview.scope == scope()
-    assert preview.persisted_changes == () and preview.dot_batches == ()
+    assert preview.tracked_state_changes == () and preview.dot_batches == ()
+    assert preview.source_metadata_retained is True
     assert preview.potential_notifications == ()
     assert preview.start_boundary == "activation time; new events only"
     assert repository.rows == before
@@ -181,7 +182,8 @@ def test_preview_names_distinct_effects(controls):
     manager, _, _ = controls
     draft = prepare(manager, policy=WatchPolicy(store_state=True, wake_dot=True, notify=True))
     preview = manager.preview(draft.watch_id, expected_revision=1)
-    assert preview.persisted_changes == (EVENT,)
+    assert preview.tracked_state_changes == (EVENT,)
+    assert preview.source_metadata_retained is True
     assert preview.dot_batches == (EVENT,)
     assert preview.potential_notifications == (EVENT,)
     assert preview.removed_targets == () and preview.added_targets == scope().targets
@@ -279,7 +281,8 @@ def test_stateless_batches_need_no_obligation_tracking(controls):
     manager, _, _ = controls
     draft = prepare(manager, policy=WatchPolicy(wake_dot=True))
     preview = manager.preview(draft.watch_id, expected_revision=1)
-    assert preview.persisted_changes == ()
+    assert preview.tracked_state_changes == ()
+    assert preview.source_metadata_retained is True
     assert preview.dot_batches == (EVENT,)
     assert preview.potential_notifications == ()
 

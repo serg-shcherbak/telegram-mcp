@@ -190,7 +190,7 @@ class WatchManager:
             capabilities=tuple(self._catalog[name] for name in draft.capabilities),
             added_targets=tuple(target for target in selected if target not in previous),
             removed_targets=tuple(target for target in previous if target not in selected),
-            persisted_changes=draft.capabilities if draft.policy.store_state else (),
+            tracked_state_changes=draft.capabilities if draft.policy.store_state else (),
             dot_batches=draft.capabilities if draft.policy.wake_dot else (),
             potential_notifications=draft.capabilities if draft.policy.notify else (),
         )
