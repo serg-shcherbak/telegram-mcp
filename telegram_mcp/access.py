@@ -156,11 +156,18 @@ def effective_chat_scope(legacy):
     connection = current_connection.get()
     if connection is None:
         return legacy
-    scope = getattr(connection.revalidate(), current_operation.get())
+    scope = _operation_scope(connection.revalidate(), current_operation.get())
     if scope is None:
         return legacy
     # shortcut: legacy ceilings need numeric IDs; resolve handles if mixed spellings are needed.
     return set(scope) if legacy is None else set(scope).intersection(legacy)
+
+
+def _operation_scope(profile, operation):
+    scope = getattr(profile, operation)
+    if operation == "attachments" and profile.read is not None:
+        return profile.read if scope is None else scope.intersection(profile.read)
+    return scope
 
 
 class BackendAuthMiddleware:
@@ -207,6 +214,10 @@ class BackendAuthMiddleware:
 
 
 READ_TOOLS = frozenset({"get_chats", "get_messages", "search_messages", "list_chats"})
+TOOL_OPERATIONS = {name: "read" for name in READ_TOOLS} | {
+    "send_message": "send",
+    "export_attachment": "attachments",
+}
 SEND_DESCRIPTION = (
     "Send only after Dot obtains confirmation of the exact recipient, full text, and reply "
     "target for this call. Cancellation means no send. Never retry an unknown send result "
@@ -258,7 +269,16 @@ class DotMCP(FastMCP):
                 icons=tool.icons,
                 meta=tool.meta.copy() if tool.meta else None,
             )
+        from telegram_mcp.attachments import export_attachment
         from telegram_mcp.runtime import _install_annotation_hook
+
+        self.add_tool(
+            export_attachment,
+            annotations=ToolAnnotations(
+                readOnlyHint=True, destructiveHint=False, openWorldHint=True, idempotentHint=True
+            ),
+            structured_output=False,
+        )
 
         _install_annotation_hook(self)
 
@@ -321,14 +341,13 @@ class DotMCP(FastMCP):
         return [
             tool
             for tool in tools
-            if (tool.name in READ_TOOLS and profile.read != frozenset())
-            or (tool.name == "send_message" and profile.send != frozenset())
+            if _operation_scope(profile, TOOL_OPERATIONS[tool.name]) != frozenset()
         ]
 
     async def call_tool(self, name: str, arguments: dict[str, Any]):
         profile = self._profile()
-        operation = "read" if name in READ_TOOLS else "send" if name == "send_message" else None
-        if operation is None or getattr(profile, operation) == frozenset():
+        operation = TOOL_OPERATIONS.get(name)
+        if operation is None or _operation_scope(profile, operation) == frozenset():
             raise AccessDenied("Operation is not permitted for this connection")
         tool = self._tool_manager.get_tool(name)
         if set(arguments) - set(tool.parameters.get("properties", {})):
@@ -337,6 +356,16 @@ class DotMCP(FastMCP):
             raise ToolError("Invalid source identifier")
         if arguments.get("account") not in (None, "default"):
             raise AccessDenied("Account is not permitted")
+        if name == "export_attachment" and (
+            not isinstance(arguments.get("chat_id"), (int, str))
+            or type(arguments.get("message_id")) is not int
+            or not 0 < arguments["message_id"] < 2**31
+            or (
+                arguments.get("media_id") is not None
+                and not isinstance(arguments["media_id"], str)
+            )
+        ):
+            raise ToolError("Invalid source identifier")
         operation_token = current_operation.set(operation)
         try:
             result = await super().call_tool(name, arguments)

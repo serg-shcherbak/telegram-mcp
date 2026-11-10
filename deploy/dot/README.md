@@ -3,8 +3,12 @@
 This is the direct-task installation definition under development. It has not passed
 image-build, Dot original-file acceptance, or release checks. Do not replace an existing
 service with it until those checks pass and deployment is authorized. Observation is off.
-The server supplies permitted Telegram operations; Dot analyzes originals. Original export
-and the new direct ASR interface are not exposed yet.
+The server supplies permitted Telegram operations; Dot analyzes originals. A provisional
+`export_attachment` tool is available only when both read and attachment scopes permit
+the source. It returns at most 6,000,000 original bytes as a private MCP embedded resource;
+actual Dot materialization remains unverified. Follow the separate
+[synthetic acceptance procedure](../../docs/acceptance/dot-originals.md) before enabling it
+on personal sources. The new direct ASR interface is not exposed yet.
 
 Use one existing own Telegram file session. Stop the process using that authorization
 before migration or startup; never run a second client with the same authorization key.
