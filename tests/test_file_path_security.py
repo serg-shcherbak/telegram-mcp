@@ -182,7 +182,7 @@ async def test_symlinks_that_stay_inside_root_resolve_to_their_target(tmp_path, 
 
 
 @pytest.mark.asyncio
-async def test_client_roots_replace_server_allowlist(tmp_path, monkeypatch):
+async def test_client_roots_cannot_replace_server_allowlist(tmp_path, monkeypatch):
     server_root = (tmp_path / "server_root").resolve()
     client_root = (tmp_path / "client_root").resolve()
     server_root.mkdir(parents=True)
@@ -196,15 +196,38 @@ async def test_client_roots_replace_server_allowlist(tmp_path, monkeypatch):
     ctx = _DummyContext([types.Root(uri=client_root.as_uri())])
 
     roots = await main._get_effective_allowed_roots(ctx)
-    assert roots == [client_root]
+    assert roots == []
 
     resolved, error = await main._resolve_readable_file_path(
         raw_path="client.txt",
         ctx=ctx,
         tool_name="send_file",
     )
-    assert error is None
-    assert resolved == client_file.resolve()
+    assert error is not None
+    assert resolved is None
+
+
+@pytest.mark.asyncio
+async def test_client_parent_root_is_intersected_with_server_root(tmp_path, monkeypatch):
+    root = tmp_path / "media"
+    root.mkdir()
+    monkeypatch.setattr(main, "SERVER_ALLOWED_ROOTS", [root.resolve()])
+    roots = await main._get_effective_allowed_roots(
+        _DummyContext([types.Root(uri=tmp_path.as_uri())])
+    )
+    assert roots == [root.resolve()]
+
+
+@pytest.mark.asyncio
+async def test_client_child_root_narrows_server_root(tmp_path, monkeypatch):
+    root = tmp_path / "media"
+    child = root / "client"
+    child.mkdir(parents=True)
+    monkeypatch.setattr(main, "SERVER_ALLOWED_ROOTS", [root.resolve()])
+    roots = await main._get_effective_allowed_roots(
+        _DummyContext([types.Root(uri=child.as_uri())])
+    )
+    assert roots == [child.resolve()]
 
 
 @pytest.mark.asyncio

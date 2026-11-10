@@ -74,6 +74,7 @@ from functools import wraps
 import telethon.errors.rpcerrorlist
 from sanitize import sanitize_user_content, sanitize_name, sanitize_dict, format_tool_result
 from telegram_mcp.client_identity import client_identity_kwargs
+from telegram_mcp.access import current_connection, effective_chat_scope
 
 
 class ValidationError(Exception):
@@ -210,10 +211,12 @@ def _tool_timeout_seconds(value: Optional[str] = None) -> Optional[float]:
     return timeout if timeout > 0 else None
 
 
-def _install_annotation_hook() -> None:
+def _install_annotation_hook(server: Optional[FastMCP] = None) -> None:
     from mcp.types import CallToolRequest, ServerResult, CallToolResult
 
-    original_handler = mcp._mcp_server.request_handlers[CallToolRequest]
+    if server is None:
+        server = mcp
+    original_handler = server._mcp_server.request_handlers[CallToolRequest]
 
     async def annotated_handler(req):
         timeout = _tool_timeout_seconds()
@@ -254,7 +257,7 @@ def _install_annotation_hook() -> None:
                 ]
         return response
 
-    mcp._mcp_server.request_handlers[CallToolRequest] = annotated_handler
+    server._mcp_server.request_handlers[CallToolRequest] = annotated_handler
 
 
 _install_annotation_hook()
@@ -1219,8 +1222,8 @@ def get_effective_allowed_chat_ids() -> Optional[set[Union[int, str]]]:
     """Return the currently effective set of allowed chat IDs, or None if allowlist is disabled."""
     env_raw = os.getenv("TELEGRAM_ALLOWED_CHAT_IDS")
     if env_raw is not None:
-        return _parse_allowed_chat_ids(env_raw)
-    return ALLOWED_CHAT_IDS
+        return effective_chat_scope(_parse_allowed_chat_ids(env_raw))
+    return effective_chat_scope(ALLOWED_CHAT_IDS)
 
 
 def is_chat_allowlist_enabled() -> bool:
@@ -1274,6 +1277,8 @@ def is_chat_allowed(chat_identifier: Any, entity: Any = None) -> bool:
 def check_chat_access(chat_identifier: Any, entity: Any = None) -> Optional[str]:
     """Return an error message if chat access is restricted, or None if allowed."""
     if not is_chat_allowed(chat_identifier, entity):
+        if current_connection.get() is not None:
+            return "Access to the requested source is restricted by connection policy."
         return (
             f"Access to chat '{chat_identifier}' is restricted by privacy policy "
             "(TELEGRAM_ALLOWED_CHAT_IDS)."
@@ -1360,6 +1365,11 @@ def log_and_format_error(
     if isinstance(error, AliasNeedsUser):
         return error.payload
 
+    def result(message):
+        if current_connection.get() is not None:
+            raise ToolError(message)
+        return message
+
     # Generate a consistent error code
     if isinstance(prefix, str) and prefix == "VALIDATION-001":
         # Special case for validation errors
@@ -1386,9 +1396,9 @@ def log_and_format_error(
         seconds = getattr(error, "seconds", None) or 0
         logger.warning("Telegram FloodWait; retry only after the reported delay.")
         if user_message:
-            return user_message
+            return result(user_message)
         wait_clause = f"{seconds} seconds" if seconds > 0 else "an unknown duration"
-        return (
+        return result(
             f"Rate limit exceeded (FloodWait): Telegram requires waiting {wait_clause} "
             f"before repeating this operation. Do NOT retry immediately (code: {error_code})."
         )
@@ -1399,7 +1409,7 @@ def log_and_format_error(
 
     # Return a user-friendly message
     if user_message:
-        return user_message
+        return result(user_message)
 
     # MTProto schema drift must not hide behind the generic code. Telethon releases lag
     # behind production Telegram, and when the server sends an object whose constructor
@@ -1407,7 +1417,7 @@ def log_and_format_error(
     # while their neighbours keep working. Reported as a generic error, that pattern is
     # indistinguishable from "no such user/chat" and sends debugging the wrong way.
     if _is_schema_drift(error):
-        return (
+        return result(
             f"MTProto schema mismatch: the installed Telethon does not know an object the "
             f"server sent. This is NOT a missing user or chat — the data arrived, "
             f"parsing it failed. Upgrade Telethon; if it is already the latest release, its "
@@ -1421,9 +1431,9 @@ def log_and_format_error(
         reported = (
             f"{telegram_name} ({type(error).__name__})" if telegram_name else type(error).__name__
         )
-        return f"An error occurred (code: {error_code}): Telegram returned {reported}."
+        return result(f"An error occurred (code: {error_code}): Telegram returned {reported}.")
 
-    return f"An error occurred (code: {error_code})."
+    return result(f"An error occurred (code: {error_code}).")
 
 
 def validate_id(*param_names_to_validate, raise_errors=False):
@@ -2104,8 +2114,16 @@ def alias_ask_payload(reference: str, kind: str = "unknown", stored_id: Optional
     Server-authored text interpolating only the caller's own reference; any
     Telegram-supplied name stays quarantined inside the candidates list.
     """
-    matches = match_aliases(reference)
-    known = sorted(load_aliases())[:20]
+    matches = [
+        (alias, record)
+        for alias, record in match_aliases(reference)
+        if is_chat_allowed(record["id"])
+    ]
+    known = sorted(
+        alias for alias, record in load_aliases().items() if is_chat_allowed(record["id"])
+    )[:20]
+    if stored_id is not None and not is_chat_allowed(stored_id):
+        kind, stored_id = "unknown", None
     candidates = [
         {"alias": alias, "id": record["id"], "name": record.get("name")}
         for alias, record in matches[:5]
@@ -2197,7 +2215,7 @@ async def _resolve_with_retries(
     """
     await ensure_connected(client)
     get = getattr(client, getter)
-    scoped = is_chat_allowlist_enabled()
+    scoped = current_connection.get() is not None or is_chat_allowlist_enabled()
     last_error = None
     try:
         try:
@@ -2577,6 +2595,19 @@ async def _get_effective_allowed_roots_with_status(
     ctx: Optional[Context],
 ) -> tuple[List[Path], str]:
     fallback_roots = list(SERVER_ALLOWED_ROOTS)
+    if not fallback_roots:
+        return [], ROOTS_STATUS_NOT_CONFIGURED
+
+    def intersect(client_roots):
+        return _dedupe_paths(
+            [
+                client if client.is_relative_to(server) else server
+                for client in client_roots
+                for server in fallback_roots
+                if client.is_relative_to(server) or server.is_relative_to(client)
+            ]
+        )
+
     if ctx is None:
         if fallback_roots:
             return fallback_roots, ROOTS_STATUS_READY
@@ -2608,7 +2639,7 @@ async def _get_effective_allowed_roots_with_status(
         recovered_roots = _coerce_paths_from_list_roots_validation_error(error)
         if recovered_roots:
             logger.warning("MCP client returned non-URI roots; recovered validated paths.")
-            return recovered_roots, ROOTS_STATUS_READY
+            return intersect(recovered_roots), ROOTS_STATUS_READY
         if _is_roots_unsupported_error(error):
             if fallback_roots:
                 return fallback_roots, ROOTS_STATUS_UNSUPPORTED_FALLBACK
@@ -2633,7 +2664,7 @@ async def _get_effective_allowed_roots_with_status(
             continue
 
     if client_roots:
-        return _dedupe_paths(client_roots), ROOTS_STATUS_READY
+        return intersect(client_roots), ROOTS_STATUS_READY
 
     # Roots API succeeded but returned an empty list. By default this is an
     # explicit deny-all. Some clients (e.g. ones that implement the Roots

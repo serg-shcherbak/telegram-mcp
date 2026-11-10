@@ -232,6 +232,11 @@ def create_streamable_http_app(mcp_instance: Any) -> Any:
     # If not already wrapped via monkeypatch
     if not isinstance(app, ProtocolNegotiationMiddleware):
         app = ProtocolNegotiationMiddleware(app, mcp_instance)
+    config_path = getattr(mcp_instance, "_dot_access_config", None)
+    if config_path is not None:
+        from telegram_mcp.access import BackendAuthMiddleware
+
+        app = BackendAuthMiddleware(app, config_path)
     return app
 
 

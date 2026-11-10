@@ -648,6 +648,46 @@ class _DialogsClient(_FakeClient):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("actual_id,bot", [(2, False), (True, False), (1, True)])
+async def test_dot_numeric_owner_verification_rejects_other_accounts(monkeypatch, actual_id, bot):
+    client = _FakeClient(authorized=True)
+
+    async def get_me():
+        return SimpleNamespace(id=actual_id, bot=bot)
+
+    monkeypatch.setattr(client, "get_me", get_me)
+    monkeypatch.setattr(runner.mcp, "_dot_owner_id", 1, raising=False)
+    with pytest.raises(RuntimeError, match="configured owner"):
+        await runner._verify_expected_owner(client)
+    assert client.disconnected
+
+
+@pytest.mark.asyncio
+async def test_dot_does_not_warm_dialogs_during_startup(monkeypatch):
+    client = _DialogsClient(authorized=True)
+    dialogs = []
+
+    async def get_dialogs():
+        dialogs.append(True)
+        return []
+
+    async def connected(*args):
+        pass
+
+    async def serve(*args):
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(client, "get_dialogs", get_dialogs)
+    monkeypatch.setattr(runner, "clients", {"default": client})
+    monkeypatch.setattr(runner, "_connect_or_skip", connected)
+    monkeypatch.setattr(runner, "_serve", serve)
+    monkeypatch.setattr(runner.mcp, "_dot_access_config", "/synthetic/access.json", raising=False)
+    monkeypatch.setenv("MCP_TRANSPORT", "http")
+    await runner._main()
+    assert dialogs == []
+
+
+@pytest.mark.asyncio
 async def test_unauthorized_optional_default_is_skipped(monkeypatch, capsys):
     work = _DialogsClient(authorized=True, identity="work-session")
     default = _DialogsClient(authorized=False, identity="default-session")

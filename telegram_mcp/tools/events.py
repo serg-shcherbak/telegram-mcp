@@ -667,6 +667,16 @@ def register_incoming_handlers() -> None:
     handler also sees outgoing ones (sent from the owner's other devices:
     Telethon does not dispatch messages this client sent itself).
     """
+    if not _parse_bool_env(os.getenv("TELEGRAM_LEGACY_EVENTS"), True):
+        for cl in clients.values():
+            for callback, _builder in cl.list_event_handlers():
+                if callback is _on_new_incoming or (
+                    getattr(callback, "__module__", None) == __name__
+                    and getattr(callback, "__qualname__", None)
+                    == "_message_event_handler.<locals>.handler"
+                ):
+                    cl.remove_event_handler(callback)
+        return
     for label, cl in clients.items():
         try:
             cl.add_event_handler(_on_new_incoming, _events.NewMessage(incoming=True))

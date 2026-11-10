@@ -101,6 +101,16 @@ async def _verify_expected_username(label: str, client) -> None:
     )
 
 
+async def _verify_expected_owner(client) -> None:
+    expected = getattr(mcp, "_dot_owner_id", None)
+    if expected is None:
+        return
+    me = await client.get_me()
+    if type(getattr(me, "id", None)) is not int or me.id != expected or getattr(me, "bot", False):
+        await client.disconnect()
+        raise RuntimeError("Telegram session does not belong to the configured owner")
+
+
 class _NotAuthorized(RuntimeError):
     """The session connects but was never logged in."""
 
@@ -148,6 +158,7 @@ async def _connect_authorized_client(label, client) -> None:
             await asyncio.sleep(delay)
 
     if await client.is_user_authorized():
+        await _verify_expected_owner(client)
         await _verify_expected_username(label, client)
         return
 
@@ -253,7 +264,8 @@ async def _main() -> None:
         # Runs in background: blocking startup on this (e.g. under a
         # GetDialogsRequest flood wait) makes MCP clients time out, and
         # resolve_entity() re-warms the cache on miss anyway.
-        print("Warming entity caches (background)...", file=sys.stderr)
+        if getattr(mcp, "_dot_access_config", None) is None:
+            print("Warming entity caches (background)...", file=sys.stderr)
 
         async def _warm_caches() -> None:
             async def _warm_client(label: str, cl: TelegramClient) -> None:
@@ -274,7 +286,8 @@ async def _main() -> None:
             except Exception as warm_exc:
                 print(f"Entity cache warm failed: {warm_exc}", file=sys.stderr)
 
-        asyncio.create_task(_warm_caches())
+        if getattr(mcp, "_dot_access_config", None) is None:
+            asyncio.create_task(_warm_caches())
 
         transport = os.getenv("MCP_TRANSPORT", "stdio").lower()
 
