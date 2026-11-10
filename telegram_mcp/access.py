@@ -1,5 +1,3 @@
-"""Owner-configured connection scopes for the private Dot server."""
-
 from __future__ import annotations
 
 import hmac
@@ -20,7 +18,7 @@ class AccessDenied(ToolError):
     """A connection has no current permission for this operation."""
 
 
-ChatScope = Optional[frozenset[int]]  # None requires an explicit owner choice of all chats.
+ChatScope = Optional[frozenset[int]]
 
 
 @dataclass(frozen=True)
@@ -219,8 +217,6 @@ SEND_DESCRIPTION = (
 
 
 class DotMCP(FastMCP):
-    """One stateless server reuses reviewed core tools under request-local owner scopes."""
-
     def __init__(self, config_path: Path, source: FastMCP):
         self._dot_access_config = Path(config_path)
         config = load_access_config(self._dot_access_config)

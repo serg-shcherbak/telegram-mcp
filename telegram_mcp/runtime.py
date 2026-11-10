@@ -740,9 +740,7 @@ def _build_client(session: Any, label: str) -> TelegramClient:
 # Telegram forbids one auth key (one StringSession) being used from two IPs at
 # once; on a dual-stack / VPN host two local clients can egress via different
 # source IPs and collide. The fix is one authorized session PER concurrent
-# client (Telegram allows one account on many "devices"). Existing legacy strings
-# may be listed in TELEGRAM_SESSION_STRINGS (whitespace/comma/semicolon separated).
-# Private session setup now creates native files without exporting strings. Each process
+# client (Telegram allows one account on many "devices"). Each process
 # claims the first session not already locked by a live process via an advisory
 # flock, so clients deterministically pick distinct slots; the OS releases the
 # lock if a process dies.
@@ -858,8 +856,7 @@ def _discover_accounts() -> dict[str, TelegramClient]:
         elif session_name:
             accounts["default"] = _build_client(_resolve_session_path(session_name), "default")
             if len(accounts) > 1:
-                # A legacy configuration may also name an unused default file session.
-                # The runner skips it instead of refusing to start labelled accounts.
+                # Preserve labeled-account startup with an uninitialized legacy default file.
                 OPTIONAL_ACCOUNTS.add("default")
 
     if not accounts:
@@ -1160,7 +1157,6 @@ _NUMERIC_CHAT_ID_RE = re.compile(r"-?\d+")
 CHAT_PARAM_NAMES: frozenset[str] = frozenset(
     {"chat_id", "from_chat_id", "to_chat_id", "channel", "contact_id", "group_id"}
 )
-# Member lookups inside a checked group operation are not additional source chats.
 _chat_resolution_targets: ContextVar[Optional[tuple[Any, ...]]] = ContextVar(
     "chat_resolution_targets", default=None
 )
@@ -2609,10 +2605,8 @@ async def _get_effective_allowed_roots_with_status(
         )
 
     if ctx is None:
-        if fallback_roots:
-            return fallback_roots, ROOTS_STATUS_READY
-        return [], ROOTS_STATUS_NOT_CONFIGURED
-    if fallback_roots and _server_roots_only_enabled():
+        return fallback_roots, ROOTS_STATUS_READY
+    if _server_roots_only_enabled():
         return fallback_roots, ROOTS_STATUS_SERVER_ONLY
 
     try:
@@ -2622,7 +2616,7 @@ async def _get_effective_allowed_roots_with_status(
         else:
             list_roots_result = await asyncio.wait_for(ctx.session.list_roots(), timeout)
     except asyncio.TimeoutError:
-        if fallback_roots and _server_roots_fallback_enabled():
+        if _server_roots_fallback_enabled():
             logger.warning(
                 "MCP client did not answer roots/list before the configured timeout "
                 "(TELEGRAM_ROOTS_TIMEOUT_SECONDS); falling back to server CLI roots "
@@ -2641,12 +2635,10 @@ async def _get_effective_allowed_roots_with_status(
             logger.warning("MCP client returned non-URI roots; recovered validated paths.")
             return intersect(recovered_roots), ROOTS_STATUS_READY
         if _is_roots_unsupported_error(error):
-            if fallback_roots:
-                return fallback_roots, ROOTS_STATUS_UNSUPPORTED_FALLBACK
-            return [], ROOTS_STATUS_NOT_CONFIGURED
+            return fallback_roots, ROOTS_STATUS_UNSUPPORTED_FALLBACK
         # Unexpected list_roots failures (e.g. malformed client payloads that we
         # could not recover). Match empty-list behavior: opt-in server fallback.
-        if fallback_roots and _server_roots_fallback_enabled():
+        if _server_roots_fallback_enabled():
             logger.warning(
                 "MCP roots request failed; falling back to server CLI roots "
                 "(TELEGRAM_ALLOW_SERVER_ROOTS_FALLBACK).",
@@ -2671,7 +2663,7 @@ async def _get_effective_allowed_roots_with_status(
     # capability but expose no roots) advertise an empty list even though the
     # operator configured server-side CLI roots; for those, an opt-in lets the
     # server-side roots take effect instead of disabling file tools entirely.
-    if fallback_roots and _server_roots_fallback_enabled():
+    if _server_roots_fallback_enabled():
         return fallback_roots, ROOTS_STATUS_SERVER_FALLBACK
     return [], ROOTS_STATUS_CLIENT_DENY_ALL
 

@@ -194,10 +194,6 @@ async def _connect_or_skip(label, client) -> None:
         )
 
 
-_LOCAL_ALLOWED_HOSTS = ("127.0.0.1:*", "localhost:*", "[::1]:*")
-_LOCAL_ALLOWED_ORIGINS = ("http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*")
-
-
 def _configure_transport_security() -> None:
     """Always enable FastMCP's Host/Origin validation for the HTTP transports.
 
@@ -212,6 +208,7 @@ def _configure_transport_security() -> None:
     e.g. when the server sits behind a reverse proxy on a public domain.
     """
     from mcp.server.transport_security import TransportSecuritySettings
+    from telegram_mcp.transport.http import _LOCAL_ALLOWED_HOSTS, _LOCAL_ALLOWED_ORIGINS
 
     raw_hosts = os.getenv("MCP_ALLOWED_HOSTS", "")
     allowed_hosts = [h.strip() for h in raw_hosts.split(",") if h.strip()]

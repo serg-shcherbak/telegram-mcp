@@ -1,5 +1,3 @@
-"""Private single-owner Dot entrypoint; no observation or file-path tools."""
-
 from __future__ import annotations
 
 import asyncio
@@ -13,7 +11,6 @@ from telegram_mcp.access import DotMCP, load_access_config, validate_media_root
 
 
 def prepare():
-    """Validate local owner settings before constructing the existing Telegram client."""
     load_dotenv()
     raw_path = os.getenv("DOT_ACCESS_CONFIG")
     if not raw_path or not Path(raw_path).is_absolute():
