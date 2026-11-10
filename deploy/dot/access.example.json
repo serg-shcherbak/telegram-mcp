@@ -1,0 +1,12 @@
+{
+  "owner_id": 1,
+  "media_root": "/app/state/media",
+  "profiles": {
+    "dot": {
+      "token": "REPLACE_ME",
+      "send": [],
+      "attachments": [],
+      "external_asr": []
+    }
+  }
+}

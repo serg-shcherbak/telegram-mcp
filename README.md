@@ -9,6 +9,10 @@
 
 A Telegram integration for Claude, Cursor, and other MCP-compatible clients. It exposes Telegram account, chat, message, contact, media, folder, and admin operations through the [Model Context Protocol](https://modelcontextprotocol.io/) using [Telethon](https://docs.telethon.dev/).
 
+The [private Dot installation](deploy/dot/README.md) is under development. Original-file
+acceptance in Dot, image build, and this fork's release CI remain pending. The badges above
+report upstream checks.
+
 ## 🤖 MCP in Action
 
 Basic Telegram MCP usage in Claude:
@@ -232,16 +236,26 @@ cd telegram-mcp
 uv sync
 ```
 
-### 2. Generate a Session String
+### 2. Create a Private Native Session
+
+Reuse your existing own authorized file session if one is already available. Otherwise,
+stop the server and set `TELEGRAM_API_ID` and `TELEGRAM_API_HASH` in your local environment
+or a private UTF-8 environment file outside the checkout (mode 0600). Then run:
 
 ```bash
 uv run session_string_generator.py
 ```
 
-Follow the prompts. Save the generated session string securely. A session
-string is convenient for initial setup and portable deployments; for a
-long-running server, migrate it to a persistent file session after configuring
-your environment (see below).
+Follow the prompts. The generator creates a native SQLite session in a 0700 directory
+under `${XDG_STATE_HOME:-~/.local/state}/telegram-mcp/sessions/`, with file mode 0600 before
+any authorization write. It prints only the session path and matching
+`TELEGRAM_SESSION_NAME` setting. It does not print a serialized session or update `.env`.
+An existing destination or SQLite sidecar is refused; keep and reuse existing sessions.
+Private file setup currently requires POSIX permissions; native Windows setup fails before
+authorization writes until its ACL protection is verified. The supported Dot target is the
+Linux container described below.
+Setting `TELEGRAM_SESSION_NAME` selects another private destination outside the checkout
+and configured media roots. Account labels produce suffixed variable names.
 
 For scripted setup or operational runbooks, choose the login method explicitly:
 
@@ -257,10 +271,13 @@ Without a flag, the generator keeps the interactive method prompt.
 
 ### 3. Configure Environment
 
-Copy the example file and fill in your real values:
+Keep real values in a private environment file outside the checkout and media roots.
+For example, create the file with a private umask, then edit it:
 
 ```bash
-cp .env.example .env
+umask 077
+mkdir -p ~/.config/telegram-mcp
+touch ~/.config/telegram-mcp/telegram.env
 ```
 
 Single-account setup:
@@ -268,25 +285,37 @@ Single-account setup:
 ```env
 TELEGRAM_API_ID=your_api_id_here
 TELEGRAM_API_HASH=your_api_hash_here
-TELEGRAM_SESSION_STRING=your_session_string_here
+TELEGRAM_SESSION_NAME=/absolute/private/path/from/the/generator
 ```
 
-### Recommended: Persistent Session for Long-Running Servers
+Load that file through your process manager, or use it for setup explicitly:
+
+```bash
+uv run --env-file ~/.config/telegram-mcp/telegram.env session_string_generator.py --qr
+```
+
+Use the same private environment file when starting the server.
+For the separate single-owner Dot profile, see the [private installation definition](deploy/dot/README.md).
+That profile is under development; image-build and actual Dot original-file acceptance remain outstanding.
+
+### Migrate an Existing StringSession
 
 `StringSession` stores the Telegram authorization key, but not Telethon's update
 state. After a restart, a busy account can therefore receive a large backlog of
 updates. A local SQLite session persists the update cursor and entity cache, so
 subsequent reconnects receive only the missed delta.
 
-Stop all running telegram-mcp processes, then migrate the string configured in
-`.env`:
+New logins already use SQLite. If you have an existing StringSession, stop every process
+using it, load its private environment, then migrate:
 
 ```bash
 uv run telegram-mcp-migrate-session
 ```
 
-The command verifies the new session with Telegram and prints the exact setting
-to use. Update `.env` as instructed, for example:
+The command creates a new private file under the same XDG state directory by default,
+verifies it with Telegram, and prints the setting to use. Source configuration is
+unchanged; failure or cancellation removes only the new target. Update your private
+environment file as instructed, for example:
 
 ```env
 # Remove or comment this out; it takes precedence when both are present.
@@ -426,9 +455,12 @@ npx @anthropic-ai/mcpb pack . telegram-mcp.mcpb
 ```
 
 Open the resulting `telegram-mcp.mcpb` with Claude Desktop (or drag it onto
-Settings → Extensions) and fill in the API ID, API hash and session string
-(see [Quick Start](#quick-start) for generating one). Claude Desktop installs
-Python and the dependencies itself via `uv`, and masks the API hash and
+Settings → Extensions) and fill in the API ID, API hash and absolute private native
+session path from [Quick Start](#quick-start). Keep the session outside the bundle and
+allowed files directory, and stop any process using it before connecting. Existing bundle
+users can retain their legacy sensitive session-string field instead; fill exactly one
+session setting. Leaving both empty fails without interactive login. Claude Desktop installs
+Python and the dependencies itself via `uv`, and masks the API hash and legacy
 session string as sensitive fields. The allowed-chats and files-directory fields map to
 `TELEGRAM_ALLOWED_CHAT_IDS` and `TELEGRAM_ALLOWED_ROOTS`. `.mcpbignore` keeps
 `.env`, session files and logs out of the bundle.
@@ -452,7 +484,7 @@ this project:
       "env": {
         "TELEGRAM_API_ID": "your_api_id_here",
         "TELEGRAM_API_HASH": "your_api_hash_here",
-        "TELEGRAM_SESSION_STRING": "your_session_string_here"
+        "TELEGRAM_SESSION_NAME": "/absolute/private/path/from/session_setup"
       }
     }
   }
@@ -491,14 +523,14 @@ Then configure your MCP client to run the installed console script:
       "env": {
         "TELEGRAM_API_ID": "your_api_id_here",
         "TELEGRAM_API_HASH": "your_api_hash_here",
-        "TELEGRAM_SESSION_STRING": "your_session_string_here"
+        "TELEGRAM_SESSION_NAME": "/absolute/private/path/from/session_setup"
       }
     }
   }
 }
 ```
 
-Generate a session string without cloning the repo by sourcing this repository
+Create a private native session without cloning the repo by sourcing this repository
 from GitHub explicitly:
 
 ```bash
@@ -568,13 +600,13 @@ Use suffixed session variables to configure multiple Telegram accounts:
 ```env
 TELEGRAM_API_ID=your_api_id_here
 TELEGRAM_API_HASH=your_api_hash_here
-TELEGRAM_SESSION_STRING_WORK=session_string_for_work
-TELEGRAM_SESSION_STRING_PERSONAL=session_string_for_personal
+TELEGRAM_SESSION_NAME_WORK=/absolute/private/path/to/work
+TELEGRAM_SESSION_NAME_PERSONAL=/absolute/private/path/to/personal
 ```
 
 Labels are lowercased and become the `account` parameter value in tools.
 
-If `TELEGRAM_SESSION_NAME` is set as well (the Docker image and `.env.example` set it), that
+If `TELEGRAM_SESSION_NAME` is set as well, that
 session becomes an extra `default` account when it is logged in; when it is not, the server
 skips it with a warning on stderr instead of refusing to start.
 
@@ -602,8 +634,9 @@ pick distinct sessions:
 TELEGRAM_SESSION_STRINGS=<session A> <session B> <session C>
 ```
 
-Generate extra sessions with `uv run session_string_generator.py`. The pool
-takes precedence over `TELEGRAM_SESSION_STRING` for the default account. As an
+This legacy pool accepts existing StringSessions; the onboarding generator now creates
+native files and does not export strings. The pool takes precedence over
+`TELEGRAM_SESSION_STRING` for the default account. As an
 extra safety net, a transient `AuthKeyDuplicatedError` at connect time (e.g.
 during a VPN reconnect) is retried with backoff before the server gives up.
 
@@ -646,7 +679,7 @@ If left unset, Telethon falls back to the host platform (for example `arm64`).
 Because these values are re-sent on every connection, a long-running server
 would otherwise overwrite the name chosen during login on each reconnect, so
 set them to keep a stable, recognisable device name. The same variables are
-read both by the session string generator (at login) and by the server (on
+read both by private session setup (at login) and by the server (on
 every connect), so set them in the same place as your other credentials.
 
 ## Expected Account Check
@@ -770,7 +803,7 @@ From an MCP client configuration, you can pass roots via `env` or as arguments a
       "env": {
         "TELEGRAM_API_ID": "your_api_id_here",
         "TELEGRAM_API_HASH": "your_api_hash_here",
-        "TELEGRAM_SESSION_STRING": "your_session_string_here"
+        "TELEGRAM_SESSION_NAME": "/absolute/private/path/from/session_setup"
       }
     }
   }
@@ -797,69 +830,15 @@ If `TELEGRAM_ALLOWED_CHAT_IDS` is unset or empty, the server operates in unrestr
 
 ## Docker
 
-Build the image:
+The supported Dot build definition is [deploy/dot/Dockerfile](deploy/dot/Dockerfile),
+with the frozen `uv.lock` and [private configuration](deploy/dot/README.md). It uses one
+existing owner session, credential-selected scopes, separate private mounts, and loopback
+publication. Follow that document for build prerequisites and configuration.
 
-```bash
-docker build -t telegram-mcp:latest .
-```
-
-### Shared server (recommended)
-
-Run one long-lived container serving streamable HTTP, and point every MCP
-client at it (see [Transports](#transports) for client registration):
-
-```bash
-docker run -d --name telegram-mcp --restart unless-stopped \
-  --env-file .env \
-  -e MCP_TRANSPORT=http \
-  -e MCP_HOST=0.0.0.0 \
-  -p 127.0.0.1:8765:8765 \
-  telegram-mcp:latest
-```
-
-`MCP_HOST=0.0.0.0` binds inside the container so the published port works;
-`-p 127.0.0.1:8765:8765` keeps the server reachable only from the local
-machine — the endpoint is unauthenticated, so never publish it on a public
-interface.
-
-The bundled Compose file runs the same setup:
-
-```bash
-docker compose up --build -d
-```
-
-It also mounts `./transcript_cache` into the container at
-`/app/data/transcripts` so the voice-transcription SQLite cache (see
-[Voice transcription](#voice-transcription)) survives a rebuild instead of
-living in the container's writable layer. Create it once, owned by the
-container's `appuser` (uid 1000), before starting:
-
-```bash
-mkdir -p ./transcript_cache && chown 1000:1000 ./transcript_cache
-```
-
-### One container per client (stdio)
-
-Alternatively, an MCP client can spawn a dedicated container itself:
-
-```json
-{
-  "mcpServers": {
-    "telegram-mcp": {
-      "command": "docker",
-      "args": ["run", "-i", "--rm", "--env-file", "/full/path/to/.env", "telegram-mcp:latest"]
-    }
-  }
-}
-```
-
-This is fine for a single client, but with several clients (or coding agents
-that spawn subagent sessions) each one starts its own container and its own
-Telegram session, which Telegram throttles; a client that exits uncleanly can
-also leave its container running. Prefer the shared server above in those
-setups.
-
-For multiple accounts, pass variables such as `TELEGRAM_SESSION_STRING_WORK` and `TELEGRAM_SESSION_STRING_PERSONAL`.
+The root `Dockerfile` and `docker-compose.yml` remain upstream reference material. The
+restricted build context is defined for the Dot Dockerfile. Image-build and Dot acceptance
+checks are still pending; replacing an existing service requires separate deployment
+authority.
 
 ## Development
 
@@ -906,7 +885,8 @@ uv run flake8 .
   `telegram-mcp` distributions without a source checkout or direct git/file
   install record. That guard cannot run when the unrelated PyPI package itself
   is launched, so use clone-based or explicit git installs.
-- Prefer session strings over file sessions when running multiple server instances.
+- Give concurrent instances distinct authorized sessions; never reuse an authorization
+  key across clients on different IPs. The Dot profile uses one private file session.
 - By default, Telegram API calls go directly from your machine/container to Telegram.
   If `TELEGRAM_PROXY_*` is configured, Telegram traffic is routed through the
   configured SOCKS/HTTP/MTProxy proxy instead.
@@ -928,7 +908,9 @@ Telegram messages, display names, chat titles, and button labels are untrusted c
 - **Session is not authorized:** run `uv run session_string_generator.py --qr` outside
   the MCP server when you can scan from an existing Telegram app, or
   `uv run session_string_generator.py --phone` when you need phone-code login.
-  Then set `TELEGRAM_SESSION_STRING` in `.env`. The MCP server does not perform
+  Stop the old process first and choose a new private destination; the generator will
+  not overwrite an existing session. Then set the printed `TELEGRAM_SESSION_NAME`
+  variable in your private environment file. The MCP server does not perform
   interactive phone-code login over stdio, including after a reconnect: a session
   terminated while the server runs fails with "not authorized after reconnect".
 - **Invalid API credentials:** verify `TELEGRAM_API_ID` and `TELEGRAM_API_HASH` at [my.telegram.org/apps](https://my.telegram.org/apps).
@@ -937,7 +919,8 @@ Telegram messages, display names, chat titles, and button labels are untrusted c
 - **File tools are disabled:** pass allowed roots or configure MCP Roots in your client.
 - **File tools wait for `roots/list`:** configure server roots and set `TELEGRAM_SERVER_ROOTS_ONLY=1`.
 - **Path rejected:** ensure the path is inside an allowed root and does not use traversal or wildcard patterns.
-- **Auth errors after password changes:** regenerate your session string.
+- **Auth errors after password changes:** stop the server, create a new private session
+  outside the checkout, and update the corresponding session-name setting.
 - **Bot-only tool rejected:** regular user accounts cannot manage bot command settings.
 - **Need details:** check your MCP client logs, terminal output, and `mcp_errors.log`.
 

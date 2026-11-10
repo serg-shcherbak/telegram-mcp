@@ -1,0 +1,39 @@
+name: telegram-dot
+services:
+  telegram-mcp:
+    image: ${TELEGRAM_DOT_IMAGE:?Set an immutable image tag built from the reviewed commit}
+    env_file: ${TELEGRAM_DOT_ENV_FILE:?Set an absolute private environment file path}
+    environment:
+      MCP_TRANSPORT: http
+      MCP_HOST: 0.0.0.0
+      MCP_PORT: '8765'
+      TELEGRAM_LEGACY_EVENTS: '0'
+      TELEGRAM_EVENT_FEED: '0'
+      TELEGRAM_WARM_ENTITY_CACHE: '0'
+    ports: ['127.0.0.1:8765:8765']
+    volumes:
+      - type: bind
+        source: ${TELEGRAM_DOT_SESSION_DIR:?Set the absolute private session directory}
+        target: /app/session
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${TELEGRAM_DOT_CONFIG_DIR:?Set the absolute private access configuration directory}
+        target: /app/config
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${TELEGRAM_DOT_STATE_DIR:?Set the absolute private state directory}
+        target: /app/state
+        bind: {create_host_path: false}
+    init: true
+    restart: unless-stopped
+    mem_limit: 384m
+    memswap_limit: 384m
+    cpus: 0.25
+    pids_limit: 64
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options: {max-size: 5m, max-file: '3'}

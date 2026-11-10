@@ -24,6 +24,7 @@
       "env": {
         "TELEGRAM_API_ID": "${user_config.api_id}",
         "TELEGRAM_API_HASH": "${user_config.api_hash}",
+        "TELEGRAM_SESSION_NAME": "${user_config.session_name}",
         "TELEGRAM_SESSION_STRING": "${user_config.session_string}",
         "TELEGRAM_ALLOWED_CHAT_IDS": "${user_config.allowed_chat_ids}",
         "TELEGRAM_ALLOWED_ROOTS": "${user_config.allowed_root}"
@@ -44,12 +45,20 @@
       "required": true,
       "sensitive": true
     },
+    "session_name": {
+      "type": "string",
+      "title": "Private native session path",
+      "description": "New setup: use the absolute private path printed by session setup, outside the bundle and allowed files directory. Choose this OR an existing legacy session string; leave the other empty. Stop any process using this authorization before connecting.",
+      "required": false,
+      "default": ""
+    },
     "session_string": {
       "type": "string",
-      "title": "Session string",
-      "description": "Generate it with session_string_generator.py (see the README). Anyone holding it has full access to your account.",
-      "required": true,
-      "sensitive": true
+      "title": "Existing legacy session string",
+      "description": "Existing installations only: choose this OR a private native session path, leaving the other empty. Anyone holding this string has account access. New session setup creates private native files and does not export strings.",
+      "required": false,
+      "sensitive": true,
+      "default": ""
     },
     "allowed_chat_ids": {
       "type": "string",

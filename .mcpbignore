@@ -30,3 +30,25 @@ poetry.lock
 requirements.txt
 .pre-commit-config.yaml
 *.mcpb
+
+# Private onboarding and runtime artifacts, including nested copies and backups.
+**/.env*
+**/*.env
+**/*.env.*
+**/*.session*
+**/*.sqlite*
+**/*.db*
+**/*.bak
+**/*.backup
+**/*~
+**/state/**
+**/sessions/**
+**/transcripts/**
+**/cache/**
+**/.cache/**
+**/logs/**
+**/data/**
+**/*.log
+**/aliases.json
+**/incoming_feed.jsonl
+**/access.json*

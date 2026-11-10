@@ -164,10 +164,10 @@ async def _connect_authorized_client(label, client) -> None:
 
     raise _NotAuthorized(
         f"Telegram client '{label}' is not authorized. Interactive phone login "
-        "is disabled for the MCP server because it runs over stdio. Generate a "
-        "session string with `uv run session_string_generator.py`, then set "
-        "TELEGRAM_SESSION_STRING or TELEGRAM_SESSION_STRING_<LABEL> in .env. "
-        "For existing file sessions, run the login outside the MCP server first."
+        "is disabled for the MCP server because it runs over stdio. Stop the server, "
+        "create a new private native session with `uv run session_string_generator.py`, "
+        "then set the printed TELEGRAM_SESSION_NAME[_<LABEL>] in your private environment. "
+        "Reuse an existing authorized own file session when available."
     )
 
 

@@ -740,9 +740,9 @@ def _build_client(session: Any, label: str) -> TelegramClient:
 # Telegram forbids one auth key (one StringSession) being used from two IPs at
 # once; on a dual-stack / VPN host two local clients can egress via different
 # source IPs and collide. The fix is one authorized session PER concurrent
-# client (Telegram allows one account on many "devices"). Generate extra
-# sessions with `uv run session_string_generator.py` and list them in
-# TELEGRAM_SESSION_STRINGS (whitespace/comma/semicolon separated). Each process
+# client (Telegram allows one account on many "devices"). Existing legacy strings
+# may be listed in TELEGRAM_SESSION_STRINGS (whitespace/comma/semicolon separated).
+# Private session setup now creates native files without exporting strings. Each process
 # claims the first session not already locked by a live process via an advisory
 # flock, so clients deterministically pick distinct slots; the OS releases the
 # lock if a process dies.
@@ -803,9 +803,8 @@ def _acquire_session(pool: List[str]) -> str:
     raise RuntimeError(
         f"All {len(pool)} pooled Telegram session(s) are already claimed by other "
         "live clients, so this one has no session to use. Add another session to "
-        "TELEGRAM_SESSION_STRINGS (generate it with "
-        "`uv run session_string_generator.py`) — one slot per concurrent client — "
-        "or stop one of the other clients."
+        "the existing legacy TELEGRAM_SESSION_STRINGS pool, clear the pool and use a "
+        "distinct private TELEGRAM_SESSION_NAME file, or stop one of the other clients."
     )
 
 
@@ -859,15 +858,15 @@ def _discover_accounts() -> dict[str, TelegramClient]:
         elif session_name:
             accounts["default"] = _build_client(_resolve_session_path(session_name), "default")
             if len(accounts) > 1:
-                # The Docker image and .env.example preset TELEGRAM_SESSION_NAME, so next to
-                # labelled accounts it often names a session nobody logged in to. The runner
-                # skips such a default account instead of refusing to start.
+                # A legacy configuration may also name an unused default file session.
+                # The runner skips it instead of refusing to start labelled accounts.
                 OPTIONAL_ACCOUNTS.add("default")
 
     if not accounts:
         print(
             "Error: No Telegram session configured. "
-            "Set TELEGRAM_SESSION_STRING or TELEGRAM_SESSION_STRING_<LABEL> in .env",
+            "Set TELEGRAM_SESSION_NAME or TELEGRAM_SESSION_NAME_<LABEL> to an existing "
+            "private file session; existing legacy StringSessions are also supported.",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -980,11 +979,11 @@ async def _force_reconnect(cl: TelegramClient):
         # once, so retrying here can never succeed — surface it instead of
         # letting the caller sit in a reconnect loop.
         raise RuntimeError(
-            "Telegram session is no longer usable: the same session string was "
+            "Telegram session is no longer usable: the same authorization was "
             "used by another client at the same time (AuthKeyDuplicatedError). "
-            "Give each concurrent client its own session via "
-            "TELEGRAM_SESSION_STRINGS or TELEGRAM_SESSION_STRING_<LABEL>, then "
-            "regenerate the burned session with `uv run session_string_generator.py`."
+            "Stop the affected process and create a new private session with "
+            "`uv run session_string_generator.py`; set the printed "
+            "TELEGRAM_SESSION_NAME[_<LABEL>]. Give concurrent clients distinct sessions."
         ) from exc
     except asyncio.TimeoutError as exc:
         raise RuntimeError(
@@ -998,8 +997,9 @@ async def _force_reconnect(cl: TelegramClient):
         except Exception:
             pass
         raise RuntimeError(
-            "Telegram session is not authorized after reconnect. Re-authorize it "
-            "outside the server (session_string_generator.py) and restart."
+            "Telegram session is not authorized after reconnect. Stop the server, "
+            "create a new private session (session_string_generator.py), and restart "
+            "with its printed TELEGRAM_SESSION_NAME[_<LABEL>]."
         )
     _last_conn_verified[id(cl)] = time.time()
     reconnect_logger.warning("Forced reconnect successful")
