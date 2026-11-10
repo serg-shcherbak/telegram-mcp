@@ -34,6 +34,7 @@ import json
 import math
 import os
 import sqlite3
+import tempfile
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -624,37 +625,76 @@ async def _transcribe_via_telegram(cl, entity, msg) -> dict:
     return {"status": "ok", "text": result.text}
 
 
-async def _download_audio(cl, msg, limit: Optional[int], cfg=None):
-    """Voice note bytes, in memory only (never touches disk).
+class _AudioLimitExceeded(Exception):
+    def __init__(self, size):
+        self.size = size
 
-    Returns ``(data, None)`` or ``(None, error_dict)``. With a ``limit`` an
-    oversized recording is refused before it is downloaded when Telegram
-    states the size up front, and again after the download when it did not.
-    """
+
+class _AudioFile(io.BufferedRandom):
+    def __init__(self, limit, directory=None):
+        if directory is None:
+            raw = tempfile.TemporaryFile(mode="w+b", buffering=0)
+        else:
+            descriptor = os.open(
+                directory / "source.bin", os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600
+            )
+            raw = os.fdopen(descriptor, "w+b", buffering=0)
+        super().__init__(raw)
+        self.limit = limit
+
+    def write(self, data):
+        size = self.tell() + len(data)
+        if self.limit is not None and size > self.limit:
+            raise _AudioLimitExceeded(size)
+        return super().write(data)
+
+    def close(self):
+        try:
+            super().close()
+        except OSError:
+            # Buffered close still closes the raw file when its flush fails.
+            pass
+
+
+async def _download_audio(cl, msg, limit: Optional[int], cfg=None, *, directory=None):
+    """Download to a private, automatically deleted file; caller closes success."""
     connection = current_connection.get()
     if connection is not None:
         check_transcript_access(get_marked_id(msg.peer_id), operation=True)
     declared = getattr(getattr(msg, "file", None), "size", None)
     if limit is not None and isinstance(declared, int) and declared > limit:
         return None, _too_large(declared, limit, cfg)
+    data = None
+    ready = False
     try:
-        data = await cl.download_media(msg, file=bytes)
+        data = _AudioFile(limit, directory)
+        downloaded = await cl.download_media(msg, file=data)
+        if not data.tell():
+            return None, {"status": "error", "error": "empty media download"}
+        if connection is not None:
+            check_transcript_access(get_marked_id(msg.peer_id), operation=True)
+        if not downloaded or (isinstance(declared, int) and data.tell() < declared):
+            return None, {
+                "status": "error",
+                "reason": "download_incomplete",
+                "error": "Audio download is incomplete; no audio was sent to ASR.",
+            }
+        data.seek(0)
+        ready = True
+        return data, None
+    except _AudioLimitExceeded as error:
+        return None, _too_large(error.size, limit, cfg)
+    except AccessDenied:
+        raise
     except Exception:
         return None, {
             "status": "error",
             "reason": "download_failed",
             "error": "Audio download failed.",
         }
-    if not data:
-        return None, {"status": "error", "error": "empty media download"}
-    if connection is not None:
-        check_transcript_access(get_marked_id(msg.peer_id), operation=True)
-    # The declared size can be missing or stale; the bytes in hand cannot.
-    if limit is not None and len(data) > limit:
-        size = len(data)
-        del data
-        return None, _too_large(size, limit, cfg)
-    return data, None
+    finally:
+        if data is not None and not ready:
+            data.close()
 
 
 def _upload_name(msg) -> tuple:
@@ -672,8 +712,7 @@ async def _transcribe_via_openai_compatible(
     cl, msg, cfg: HttpEngineConfig, *, entity=None
 ) -> dict:
     """POST the recording to an OpenAI-style ``/audio/transcriptions``
-    endpoint (groq, openai). Deletes the bytes as soon as the
-    request returns."""
+    endpoint (groq, openai), streaming the bounded temporary input."""
     if not cfg.url:
         return {"status": "error", "error": engine_config_error(cfg.engine)}
 
@@ -686,13 +725,6 @@ async def _transcribe_via_openai_compatible(
     if error is not None:
         return error
 
-    filename, mime = _upload_name(msg)
-    form = {"model": cfg.model, "response_format": cfg.response_format}
-    language = transcribe_language()
-    if language:
-        form["language"] = language
-    headers = {"Authorization": f"Bearer {cfg.api_key}"} if cfg.api_key else {}
-
     try:
         if current_connection.get() is not None:
             await _revalidate_audio_source(
@@ -703,15 +735,36 @@ async def _transcribe_via_openai_compatible(
                 cfg.engine,
                 source,
             )
-        async with httpx.AsyncClient(timeout=cfg.timeout) as client:
+        filename, mime = _upload_name(msg)
+        return await _post_audio(data, cfg, filename, mime)
+    finally:
+        data.close()
+
+
+async def _post_audio(data, cfg, filename, mime):
+    data.seek(0, os.SEEK_END)
+    size = data.tell()
+    data.seek(0)
+    if cfg.max_bytes is not None and size > cfg.max_bytes:
+        return _too_large(size, cfg.max_bytes, cfg)
+    form = {"model": cfg.model, "response_format": cfg.response_format}
+    language = transcribe_language()
+    if language:
+        form["language"] = language
+    headers = {"Authorization": f"Bearer {cfg.api_key}"} if cfg.api_key else {}
+    try:
+        async with asyncio.timeout(cfg.timeout), httpx.AsyncClient(timeout=cfg.timeout) as client:
             resp = await client.post(
                 cfg.url,
                 headers=headers,
                 data=form,
-                files={"file": (filename, bytes(data), mime)},
+                files={"file": (filename, data, mime)},
             )
         resp.raise_for_status()
         payload = resp.json()
+        if not isinstance(payload, dict) or not isinstance(payload.get("text", ""), str):
+            raise ValueError("Invalid transcription response")
+        text = (payload.get("text") or "").strip()
     except httpx.HTTPStatusError as error:
         status = error.response.status_code
         reason = (
@@ -742,10 +795,6 @@ async def _transcribe_via_openai_compatible(
             "reason": "provider_outcome_unknown",
             "error": "ASR request outcome is unknown. Do not retry automatically.",
         }
-    finally:
-        del data
-
-    text = (payload.get("text") or "").strip()
     if not text:
         return {"status": "error", "error": f"empty transcript from {cfg.engine}"}
     return {"status": "ok", "text": text, "lang": payload.get("language") or language}
@@ -788,9 +837,9 @@ def _load_whisper_model(settings: tuple):
     return model
 
 
-def _run_whisper(data: bytes, settings: tuple, language: Optional[str]) -> tuple:
+def _run_whisper(data, settings: tuple, language: Optional[str]) -> tuple:
     model = _load_whisper_model(settings)
-    segments, info = model.transcribe(io.BytesIO(data), language=language, vad_filter=True)
+    segments, info = model.transcribe(data, language=language, vad_filter=True)
     # segments is a lazy generator: the actual decoding happens here, so it
     # must be consumed inside the worker thread.
     text = "".join(segment.text for segment in segments).strip()
@@ -813,13 +862,11 @@ async def _transcribe_via_whisper(cl, msg) -> dict:
     language = transcribe_language()
     try:
         async with _WHISPER_SEMAPHORE:
-            text, lang = await asyncio.to_thread(
-                _run_whisper, bytes(data), _whisper_settings(), language
-            )
+            text, lang = await asyncio.to_thread(_run_whisper, data, _whisper_settings(), language)
     except Exception:
         return {"status": "error", "error": "Local whisper transcription failed."}
     finally:
-        del data
+        data.close()
 
     if not text:
         return {"status": "error", "error": "empty transcript from whisper"}
@@ -833,21 +880,42 @@ async def transcribe(cl, entity, msg, engine: str) -> dict:
     {"status": "error", "error": ...}
     """
     if current_connection.get() is not None:
+        from telegram_mcp import transcription_jobs as jobs
+
         check_transcript_access(get_marked_id(msg.peer_id), operation=True)
         if engine != "openai":
             raise AccessDenied("Dot ASR uses official OpenAI; engine override is not permitted")
         error = engine_config_error(engine)
         if error:
             return {"status": "error", "reason": "provider_configuration", "error": error}
-        result = await _transcribe_via_openai_compatible(
-            cl, msg, http_engine_config(engine), entity=entity
-        )
+        jobs.recover()
+        cfg = http_engine_config(engine)
+        peer_id = get_marked_id(msg.peer_id)
+        identity = transcript_identity(msg, peer_id, engine, cl)
+        duration = voice_duration(msg)
+        declared = getattr(getattr(msg, "file", None), "size", None)
+        extension = _upload_name(msg)[0].rsplit(".", 1)[-1].lower()
+        if (
+            jobs.existing(identity)
+            or duration is None
+            or duration > 600
+            or (isinstance(declared, int) and declared > cfg.max_bytes)
+            or extension not in {"flac", "mp3", "mp4", "mpeg", "mpga", "m4a", "ogg", "wav", "webm"}
+        ):
+            result = await jobs.request(cl, entity, msg, cfg, identity)
+        elif jobs.busy() or _AUDIO_LOCK.locked():
+            result = {"status": "error", "reason": "asr_busy", "complete": False}
+        else:
+            async with _AUDIO_LOCK:
+                result = await _transcribe_via_openai_compatible(cl, msg, cfg, entity=entity)
+            if result.get("reason") == "too_large":
+                result = await jobs.request(cl, entity, msg, cfg, identity)
         check_transcript_access(get_marked_id(msg.peer_id), operation=True)
         if result.get("reason") != "provider_unavailable":
             return dict(
                 result,
                 source="openai",
-                complete=result.get("status") == "ok",
+                complete=result.get("complete", result.get("status") == "ok"),
                 fallback_reason=None,
             )
         if getattr(msg, "voice", None) is None and getattr(msg, "video_note", None) is None:
@@ -892,6 +960,7 @@ async def transcribe(cl, entity, msg, engine: str) -> dict:
 # the database instead - the lock below would not see the other workers.
 
 _INFLIGHT_LOCKS: dict = {}
+_AUDIO_LOCK = asyncio.Lock()
 
 
 @asynccontextmanager
@@ -927,7 +996,7 @@ def _cached_result(row: dict) -> dict:
 
 
 async def transcribe_cached(
-    cl, entity, msg, engine: str, chat_id: int, duration: Optional[int] = None
+    cl, entity, msg, engine: str, chat_id: int, duration: Optional[int] = None, *, cancel=False
 ) -> dict:
     """Cache-first transcription, at most one paid call per recording.
 
@@ -948,6 +1017,14 @@ async def transcribe_cached(
     identity = transcript_identity(msg, chat_id, engine, cl)
 
     await _revalidate_audio_source(cl, entity, chat_id, message_id, engine, identity)
+    if cancel:
+        if current_connection.get() is None:
+            return {"status": "error", "reason": "no_active_job", "complete": False}
+        from telegram_mcp import transcription_jobs as jobs
+
+        return await jobs.request(
+            cl, entity, msg, http_engine_config(engine), identity, cancel=True
+        )
     hit = get_cached_transcript(chat_id, message_id, source=engine, identity=identity)
     if hit is not None:
         return _cached_result(hit)
@@ -966,7 +1043,12 @@ async def transcribe_cached(
         result = await transcribe(cl, entity, msg, engine)
         check_transcript_access(chat_id, operation=True)
         await _revalidate_audio_source(cl, entity, chat_id, message_id, engine, identity)
-        if result.get("status") == "ok" and result.get("source", engine) == engine:
+        if (
+            result.get("status") == "ok"
+            and result.get("complete", True)
+            and not result.get("job_id")
+            and result.get("source", engine) == engine
+        ):
             save_transcript(
                 chat_id,
                 message_id,
@@ -977,7 +1059,7 @@ async def transcribe_cached(
                 identity=identity,
             )
         out = dict(result)
-        out["cached"] = False
+        out.setdefault("cached", False)
         out.setdefault("duration", duration)
         out.setdefault("source", engine)
         out.setdefault("complete", result.get("status") == "ok")

@@ -488,8 +488,9 @@ async def test_transcribe_via_groq_success(monkeypatch):
 
     async def _download_media(m, file=None):
         assert m is msg
-        assert file is bytes  # in-memory download, no disk path
-        return b"raw-audio-bytes"
+        assert hasattr(file, "write")
+        file.write(b"raw-audio-bytes")
+        return file
 
     client = SimpleNamespace(download_media=_download_media)
 
@@ -537,7 +538,8 @@ async def test_transcribe_via_groq_normalizes_audio_file_extension(
     msg = _voice_msg(file=file_obj)
 
     async def _download_media(m, file=None):
-        return b"audio-bytes"
+        file.write(b"audio-bytes")
+        return file
 
     client = SimpleNamespace(download_media=_download_media)
     result = await transcription._transcribe_via_groq(client, msg)
@@ -561,7 +563,8 @@ async def test_transcribe_via_groq_empty_download_is_error(monkeypatch):
     monkeypatch.setenv("GROQ_API_KEY", "k")
 
     async def _download_media(m, file=None):
-        return b""
+        file.write(b"")
+        return file
 
     client = SimpleNamespace(download_media=_download_media)
     result = await transcription._transcribe_via_groq(client, _voice_msg())
@@ -578,7 +581,8 @@ async def test_transcribe_via_groq_empty_transcript_is_error(monkeypatch):
     )
 
     async def _download_media(m, file=None):
-        return b"raw-audio-bytes"
+        file.write(b"raw-audio-bytes")
+        return file
 
     client = SimpleNamespace(download_media=_download_media)
     result = await transcription._transcribe_via_groq(client, _voice_msg())
@@ -785,6 +789,19 @@ async def test_failed_transcription_is_not_cached_and_leaks_no_lock(
     assert transcription._INFLIGHT_LOCKS == {}
 
 
+@pytest.mark.asyncio
+async def test_incomplete_transcript_never_becomes_a_full_cache_hit(
+    transcript_cache_dir, monkeypatch
+):
+    async def partial(*args):
+        return {"status": "ok", "text": "first part only", "complete": False}
+
+    monkeypatch.setattr(transcription, "transcribe", partial)
+    result = await transcription.transcribe_cached(None, None, _voice_msg(id=80), "groq", -100)
+    assert result["complete"] is False
+    assert transcription.get_cached_transcript(-100, 80, source="groq") is None
+
+
 # ---------------------------------------------------------------------------
 # Groq upload ceiling
 # ---------------------------------------------------------------------------
@@ -838,7 +855,8 @@ async def test_oversized_download_is_refused_when_the_size_was_not_declared(monk
     posted = {"calls": 0}
 
     async def _download(*args, **kwargs):
-        return b"0" * (2 * 1024 * 1024)
+        kwargs["file"].write(b"0" * (2 * 1024 * 1024))
+        return kwargs["file"]
 
     def _fail_post(*args, **kwargs):
         posted["calls"] += 1
@@ -860,7 +878,8 @@ async def test_recording_within_the_limit_still_uploads(monkeypatch):
     monkeypatch.setenv("TELEGRAM_TRANSCRIBE_GROQ_MAX_MB", "25")
 
     async def _download(*args, **kwargs):
-        return b"0" * 1024
+        kwargs["file"].write(b"0" * 1024)
+        return kwargs["file"]
 
     class _Resp:
         def raise_for_status(self):
@@ -900,8 +919,9 @@ async def test_recording_within_the_limit_still_uploads(monkeypatch):
 
 def _bytes_client(payload=b"raw-audio-bytes"):
     async def _download_media(m, file=None):
-        assert file is bytes
-        return payload
+        assert hasattr(file, "write")
+        file.write(payload)
+        return file
 
     return SimpleNamespace(download_media=_download_media)
 

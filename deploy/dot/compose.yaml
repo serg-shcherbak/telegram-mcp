@@ -10,6 +10,9 @@ services:
       TELEGRAM_LEGACY_EVENTS: '0'
       TELEGRAM_EVENT_FEED: '0'
       TELEGRAM_WARM_ENTITY_CACHE: '0'
+      TELEGRAM_AUDIO_SCRATCH_DIR: /app/state/audio
+    depends_on:
+      audio-converter: {condition: service_healthy}
     ports: ['127.0.0.1:8765:8765']
     volumes:
       - type: bind
@@ -34,6 +37,33 @@ services:
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
     stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options: {max-size: 5m, max-file: '3'}
+  audio-converter:
+    image: ${TELEGRAM_DOT_CONVERTER_IMAGE:?Set an immutable converter image tag built from the reviewed commit}
+    network_mode: none
+    read_only: true
+    user: '1000:1000'
+    volumes:
+      - type: bind
+        source: ${TELEGRAM_DOT_STATE_DIR:?Set the absolute private state directory}/audio
+        target: /audio
+        bind: {create_host_path: false}
+    tmpfs: ['/tmp:size=16m,mode=1777']
+    init: true
+    restart: unless-stopped
+    mem_limit: 384m
+    memswap_limit: 384m
+    cpus: 0.25
+    pids_limit: 64
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    healthcheck:
+      test: [CMD, python, -c, "from pathlib import Path; raise SystemExit(not Path('/audio/converter.sock').is_socket())"]
+      interval: 5s
+      timeout: 3s
+      retries: 6
     logging:
       driver: json-file
       options: {max-size: 5m, max-file: '3'}

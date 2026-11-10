@@ -168,6 +168,7 @@ def test_compose_resolves_private_mounts_and_loopback_limits(tmp_path):
     environment = {
         **os.environ,
         "TELEGRAM_DOT_IMAGE": "example.invalid/telegram-dot:synthetic",
+        "TELEGRAM_DOT_CONVERTER_IMAGE": "example.invalid/telegram-dot-converter:synthetic",
         "TELEGRAM_DOT_ENV_FILE": str(env_file),
         "TELEGRAM_DOT_SESSION_DIR": str(tmp_path / "session"),
         "TELEGRAM_DOT_CONFIG_DIR": str(tmp_path / "config"),
@@ -200,6 +201,18 @@ def test_compose_resolves_private_mounts_and_loopback_limits(tmp_path):
     assert set(mounts) == {"/app/session", "/app/config", "/app/state"}
     assert mounts["/app/config"]["read_only"] is True
     assert all(mount["bind"]["create_host_path"] is False for mount in mounts.values())
+    converter = json.loads(result.stdout)["services"]["audio-converter"]
+    assert converter["network_mode"] == "none" and converter["read_only"] is True
+    assert converter["user"] == "1000:1000"
+    assert converter["cap_drop"] == ["ALL"]
+    assert "no-new-privileges:true" in converter["security_opt"]
+    assert len(converter["volumes"]) == 1
+    assert converter["volumes"][0]["target"] == "/audio"
+    assert converter["volumes"][0]["source"] == str(tmp_path / "state/audio")
+    assert not converter.get("ports") and not converter.get("env_file")
+    assert not converter.get("environment")
+    assert int(converter["mem_limit"]) == int(converter["memswap_limit"]) == 384 * 1024**2
+    assert float(converter["cpus"]) == 0.25 and converter["pids_limit"] == 64
 
 
 def test_owner_example_fails_closed_then_defaults_to_saved_messages(tmp_path):

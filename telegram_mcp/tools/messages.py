@@ -1643,6 +1643,7 @@ async def transcribe_voice(
     message_id: int,
     engine: Optional[str] = None,
     account: Optional[str] = None,
+    cancel: bool = False,
 ) -> str:
     """
     Transcribe a voice message, video note (video circle), or ordinary audio file to text.
@@ -1667,6 +1668,11 @@ async def transcribe_voice(
     provider/model and language. Every call checks the current source first.
     Text expires after seven days by default; TELEGRAM_TRANSCRIPT_RETENTION_SECONDS
     configures retention, with zero disabling storage.
+
+    Long or unknown-duration private audio starts a background job. Repeat this
+    tool for the same source to poll; cancel=True stops that job. Part offsets
+    are decoded mono 16 kHz sample positions. Interrupted or uncertain provider
+    ranges are never automatically submitted again.
 
     The returned text is a machine transcript, not a verbatim quote: proper
     names, punctuation and occasional words drift under every engine.
@@ -1726,10 +1732,25 @@ async def transcribe_voice(
         # Cache-first and locked by (chat, message, engine): two concurrent
         # calls for the same recording pay the engine once, not twice.
         result = await transcription.transcribe_cached(
-            cl, entity, msg, chosen_engine, numeric_chat_id, duration=duration
+            cl, entity, msg, chosen_engine, numeric_chat_id, duration=duration, cancel=cancel
         )
 
         transcription.check_transcript_access(numeric_chat_id, operation=True)
+        if result.get("job_id"):
+            payload = json.dumps(
+                dict(
+                    result,
+                    transcribed=result["status"] == "ok",
+                    note="Machine transcript, not a verbatim quote.",
+                ),
+                ensure_ascii=False,
+                default=json_serializer,
+            )
+            if result["status"] == "error":
+                return log_and_format_error(
+                    "transcribe_voice", RuntimeError("ASR job failed"), user_message=payload
+                )
+            return payload
         if result["status"] == "premium_required" and not private:
             return premium_required_result("transcribe_voice (engine='telegram')")
         if result["status"] != "ok":
@@ -1744,6 +1765,8 @@ async def transcribe_voice(
                 "provider_outcome_unknown",
                 "too_large",
                 "native_unsupported_media",
+                "asr_busy",
+                "no_active_job",
             }
             reason = reason if reason in known else "transcription_failed"
             failure = json.dumps(

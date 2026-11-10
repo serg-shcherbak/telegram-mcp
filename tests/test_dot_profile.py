@@ -598,7 +598,8 @@ async def test_private_provider_fallback_and_specific_failures(
 
     async def download(*args, **kwargs):
         downloads.append(1)
-        return b"syntheticwav"
+        kwargs["file"].write(b"syntheticwav")
+        return kwargs["file"]
 
     class Provider:
         async def __aenter__(self):
@@ -712,7 +713,8 @@ async def test_cancelled_asr_releases_input_and_does_not_store_text(
     entered, closed = asyncio.Event(), asyncio.Event()
 
     async def download(*args, **kwargs):
-        return b"synthetic-input"
+        kwargs["file"].write(b"synthetic-input")
+        return kwargs["file"]
 
     class Provider:
         async def __aenter__(self):
@@ -767,7 +769,8 @@ async def test_revocation_during_download_prevents_external_dispatch(
     async def download(*args, **kwargs):
         data["profiles"]["reader"]["external_asr"] = []
         _write_config(path, data)
-        return b"synthetic-input"
+        kwargs["file"].write(b"synthetic-input")
+        return kwargs["file"]
 
     async def forbidden(*args, **kwargs):
         posts.append(1)
@@ -803,7 +806,8 @@ async def test_source_change_during_download_prevents_external_dispatch(
             direct_audio["message"].document.id += 1
         else:
             direct_audio["message"] = None
-        return b"synthetic-input"
+        kwargs["file"].write(b"synthetic-input")
+        return kwargs["file"]
 
     async def post(*args, **kwargs):
         posts.append(1)
