@@ -402,8 +402,9 @@ def _connect() -> sqlite3.Connection:
         """)
     _migrate_source_into_key(conn)
     conn.execute(
-        "UPDATE transcripts SET expires_at = COALESCE(unixepoch(created_at), 0) + :retention "
-        "WHERE expires_at > COALESCE(unixepoch(created_at), 0) + :retention",
+        "UPDATE transcripts SET expires_at = "
+        "COALESCE(CAST(strftime('%s', created_at) AS INTEGER), 0) + :retention "
+        "WHERE expires_at > COALESCE(CAST(strftime('%s', created_at) AS INTEGER), 0) + :retention",
         {"retention": retention_seconds()},
     )
     conn.execute("DELETE FROM transcripts WHERE expires_at <= ?", (time.time(),))
@@ -446,7 +447,7 @@ def _migrate_source_into_key(conn: sqlite3.Connection) -> None:
         INSERT OR IGNORE INTO transcripts
             (chat_id, message_id, source, text, duration, lang, created_at, expires_at)
         SELECT chat_id, message_id, source, text, duration, lang, created_at,
-            COALESCE(unixepoch(created_at), 0) + 604800
+            COALESCE(CAST(strftime('%s', created_at) AS INTEGER), 0) + 604800
         FROM transcripts_legacy;
         DROP TABLE transcripts_legacy;
         COMMIT;
