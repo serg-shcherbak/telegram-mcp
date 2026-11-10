@@ -787,6 +787,8 @@ async def list_chats(
                     elif isinstance(entity, User):
                         full = await cl(functions.users.GetFullUserRequest(id=entity))
                         about_text = getattr(full.full_user, "about", "") or ""
+                except FloodWaitError:
+                    raise
                 except Exception:
                     logger.warning("list_chats: failed to fetch one chat description")
                     about_text = "<error fetching description>"
@@ -795,6 +797,15 @@ async def list_chats(
 
             records.append(record)
 
+        if current_connection.get() is not None:
+            return format_tool_result(
+                records,
+                metadata={
+                    "complete": limit is None or len(dialogs) < limit,
+                    "dialogs_examined": len(dialogs),
+                    "limit": limit,
+                },
+            )
         if not records:
             return "No chats found matching the criteria."
 
@@ -803,6 +814,11 @@ async def list_chats(
         return log_and_format_error(
             "list_chats",
             e,
+            user_message=(
+                f"Chat traversal is incomplete (FloodWait). Wait {e.seconds} seconds before repeating it. Do NOT retry immediately."
+                if isinstance(e, FloodWaitError)
+                else None
+            ),
             chat_type=chat_type,
             limit=limit,
             unread_only=unread_only,

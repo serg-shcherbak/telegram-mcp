@@ -1,23 +1,9 @@
 #!/usr/bin/env python3
-"""
-Telegram Session String Generator
+"""Create a private native Telegram session for the MCP server.
 
-This script generates a session string that can be used for Telegram authentication
-with the Telegram MCP server. The session string allows for portable authentication
-without storing session files.
-
-Usage:
-    python session_string_generator.py
-    python session_string_generator.py --qr
-
-Requirements:
-    - telethon
-    - python-dotenv
-
-Note on ID Formats:
-When using the MCP server, please be aware that all `chat_id` and `user_id`
-parameters support integer IDs, string representations of IDs (e.g., "123456"),
-and usernames (e.g., "@mychannel").
+Usage: python session_string_generator.py [--qr | --phone]
+Stop the server before onboarding. Reuse an existing own session instead of
+running this command when the account is already connected.
 """
 
 import argparse
@@ -30,21 +16,25 @@ from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 from telethon import errors
-from telethon.sessions import StringSession
+from telethon.sessions import SQLiteSession
 from telethon.sync import TelegramClient
 from telegram_mcp.account_labels import canonical_account_label
 from telegram_mcp.client_identity import client_identity_kwargs
 from telegram_mcp.install_guard import UnsafeInstallationError, assert_safe_distribution
+from telegram_mcp.private_session import (
+    create_private_session,
+    default_session_target,
+    remove_created_session,
+    session_paths,
+)
 
 # How many times the QR code is regenerated after expiry before giving up.
 _QR_MAX_REFRESHES = 10
 
-load_dotenv()
-
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Generate a Telegram session string for telegram-mcp."
+        description="Create a private native Telegram session for telegram-mcp."
     )
     login_group = parser.add_mutually_exclusive_group()
     login_group.add_argument(
@@ -185,6 +175,7 @@ def _phone_login(client: TelegramClient) -> None:
 
 def main() -> None:
     _harden_stdio()
+    load_dotenv()
     args = _parse_args()
     _check_installation()
 
@@ -202,13 +193,8 @@ def main() -> None:
         print("Error: TELEGRAM_API_ID must be an integer")
         sys.exit(1)
 
-    print("\n----- Telegram Session String Generator -----\n")
-    print("This script will generate a session string for your Telegram account.")
-    print("The generated session string can be added to your .env file.")
-    print(
-        "\nYour credentials will NOT be stored on any server and are only "
-        "used for local authentication.\n"
-    )
+    print("\n----- Private Telegram Session Setup -----\n")
+    print("Stop the server first. Reuse your existing own session if already connected.")
 
     try:
         label = (
@@ -233,8 +219,19 @@ def main() -> None:
         print("  2) Phone number + verification code")
         method = input("\nEnter 1 or 2 [default: 1]: ").strip() or "1"
 
+    name_env = f"TELEGRAM_SESSION_NAME_{label.upper()}" if label else "TELEGRAM_SESSION_NAME"
+    default_name = f"telegram_mcp_session_{label}" if label else "telegram_mcp_session"
+    session = None
+    client = None
+    session_file = None
+    identity = None
+    completed = False
     try:
-        client = TelegramClient(StringSession(), API_ID, API_HASH, **client_identity_kwargs())
+        target = os.getenv(name_env) or default_session_target(default_name)
+        session_name, session_file = session_paths(target)
+        identity = create_private_session(session_file)
+        session = SQLiteSession(session_name)
+        client = TelegramClient(session, API_ID, API_HASH, **client_identity_kwargs())
         client.connect()
 
         if not client.is_user_authorized():
@@ -242,59 +239,34 @@ def main() -> None:
                 _qr_login(client)
             else:
                 _phone_login(client)
-
-        session_string = StringSession.save(client.session)
-
-        if label:
-            env_var = f"TELEGRAM_SESSION_STRING_{label.upper()}"
-        else:
-            env_var = "TELEGRAM_SESSION_STRING"
-
-        print("\nAuthentication successful!")
-        print("\n----- Your Session String -----")
-        print(f"\n{session_string}\n")
-        print("Add this to your .env file as:")
-        print(f"{env_var}={session_string}")
-        print("\nIMPORTANT: Keep this string private and never share it with anyone!")
-
-        try:
-            choice = input(
-                "\nWould you like to automatically update your .env file "
-                "with this session string? (y/N): "
-            )
-        except EOFError:
-            choice = "n"
-        if choice.lower() == "y":
-            try:
-                # python-dotenv reads .env as UTF-8; the locale default
-                # (cp1252, cp1251, cp936 on Windows) can't decode it.
-                with open(".env", "r", encoding="utf-8") as file:
-                    env_contents = file.readlines()
-
-                session_string_line_found = False
-                for i, line in enumerate(env_contents):
-                    if line.startswith(f"{env_var}="):
-                        env_contents[i] = f"{env_var}={session_string}\n"
-                        session_string_line_found = True
-                        break
-
-                if not session_string_line_found:
-                    env_contents.append(f"{env_var}={session_string}\n")
-
-                with open(".env", "w", encoding="utf-8") as file:
-                    file.writelines(env_contents)
-
-                print("\n.env file updated successfully!")
-            except Exception as e:
-                print(f"\nError updating .env file: {e}")
-                print("Please manually add the session string to your .env file.")
-
+        if not client.is_user_authorized():
+            raise RuntimeError("Authentication was not completed")
+        session.save()
         client.disconnect()
+        client = None
+        completed = True
+    except Exception as exc:
+        print(
+            f"Authentication failed ({type(exc).__name__}); no new session retained",
+            file=sys.stderr,
+        )
+        raise SystemExit(1) from None
+    finally:
+        try:
+            if client is not None:
+                client.disconnect()
+        finally:
+            try:
+                if session is not None:
+                    session.close()
+            finally:
+                if not completed and identity is not None:
+                    remove_created_session(session_file, identity)
 
-    except Exception as e:
-        print(f"\nError: {e}")
-        print("Failed to generate session string. Please try again.")
-        sys.exit(1)
+    print("\nAuthentication successful!")
+    print(f"Private session: {session_file}")
+    print(f"Set {name_env}={session_name}")
+    print("Keep this file private. No environment file was changed.")
 
 
 if __name__ == "__main__":

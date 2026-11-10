@@ -1,7 +1,9 @@
+import asyncio
 import os
 from types import SimpleNamespace
 
 import pytest
+from telethon.crypto import AuthKey
 
 import migrate_session
 
@@ -53,6 +55,8 @@ async def test_migrate_copies_auth_key_verifies_and_hardens_file(tmp_path, monke
     class FakeSQLiteSession:
         def __init__(self, name):
             saved["name"] = name
+            assert session_file.stat().st_mode & 0o777 == 0o600
+            assert session_file.parent.stat().st_mode & 0o777 == 0o700
             session_file.touch()
 
         def set_dc(self, dc_id, address, port):
@@ -172,3 +176,165 @@ async def test_run_reports_missing_source_session(monkeypatch, capsys):
 
     assert result == 1
     assert "TELEGRAM_SESSION_STRING must be set" in capsys.readouterr().err
+
+
+@pytest.mark.asyncio
+async def test_migrate_cancelled_verification_cleans_target_and_preserves_source(
+    tmp_path, monkeypatch
+):
+    source = "synthetic-source-session"
+    monkeypatch.setenv("TELEGRAM_SESSION_STRING", source)
+    monkeypatch.setattr(
+        migrate_session,
+        "StringSession",
+        lambda value: SimpleNamespace(
+            dc_id=2, server_address="server", port=443, auth_key=AuthKey(data=b"x" * 256)
+        ),
+    )
+
+    class CancelledClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def connect(self):
+            raise asyncio.CancelledError
+
+        async def disconnect(self):
+            pass
+
+    monkeypatch.setattr(migrate_session, "TelegramClient", CancelledClient)
+    target = tmp_path / "telegram"
+    with pytest.raises(asyncio.CancelledError):
+        await migrate_session.migrate(source, 123, "hash", str(target))
+    assert not target.with_suffix(".session").exists()
+    assert os.environ["TELEGRAM_SESSION_STRING"] == source
+
+
+@pytest.mark.asyncio
+async def test_migrate_refuses_dangling_symlink_and_preserves_it(tmp_path):
+    session = tmp_path / "telegram.session"
+    missing = tmp_path / "missing"
+    session.symlink_to(missing)
+    with pytest.raises(FileExistsError, match="already exists"):
+        await migrate_session.migrate("secret", 123, "hash", str(session))
+    assert session.is_symlink()
+    assert not missing.exists()
+
+
+@pytest.mark.asyncio
+async def test_migrate_refuses_checkout_and_media_targets(monkeypatch, tmp_path):
+    from pathlib import Path
+
+    monkeypatch.setenv("TELEGRAM_ALLOWED_ROOTS", str(tmp_path / "media"))
+    for target in (
+        Path(migrate_session.__file__).parent / "private-test",
+        tmp_path / "media" / "auth",
+    ):
+        with pytest.raises(ValueError, match="outside"):
+            await migrate_session.migrate("secret", 123, "hash", str(target))
+        assert not target.with_suffix(".session").exists()
+
+
+@pytest.mark.asyncio
+async def test_run_default_uses_private_state_path_without_printing_source(
+    monkeypatch, tmp_path, capsys
+):
+    monkeypatch.setenv("TELEGRAM_API_ID", "123")
+    monkeypatch.setenv("TELEGRAM_API_HASH", "hash")
+    monkeypatch.setenv("TELEGRAM_SESSION_STRING", "synthetic-source-session")
+    monkeypatch.delenv("TELEGRAM_SESSION_NAME", raising=False)
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    targets = []
+
+    async def fake_migrate(source, api_id, api_hash, target):
+        targets.append(target)
+        return tmp_path / "telegram.session", SimpleNamespace(id=42)
+
+    monkeypatch.setattr(migrate_session, "migrate", fake_migrate)
+    assert await migrate_session._run(SimpleNamespace(account=None, target=None)) == 0
+    assert targets == [str(tmp_path / "telegram-mcp" / "sessions" / "telegram_mcp_session")]
+    assert "synthetic-source-session" not in capsys.readouterr().out
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("suffix", ["-journal", "-wal", "-shm"])
+async def test_migrate_preserves_preexisting_sqlite_sidecars(tmp_path, suffix):
+    session = tmp_path / "telegram.session"
+    sidecar = tmp_path / f"telegram.session{suffix}"
+    sidecar.write_bytes(b"existing-sidecar")
+    with pytest.raises(FileExistsError, match="already exists"):
+        await migrate_session.migrate("secret", 123, "hash", str(session))
+    assert sidecar.read_bytes() == b"existing-sidecar"
+    assert not session.exists()
+
+
+@pytest.mark.asyncio
+async def test_migrate_rejects_permissive_parent_before_writing(tmp_path):
+    directory = tmp_path / "public"
+    directory.mkdir(mode=0o755)
+    with pytest.raises(ValueError, match="owner-only"):
+        await migrate_session.migrate("secret", 123, "hash", str(directory / "telegram"))
+    assert list(directory.iterdir()) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("separator", [",", ";", os.pathsep])
+async def test_migrate_checks_every_configured_media_root(monkeypatch, tmp_path, separator):
+    media = tmp_path / "media"
+    monkeypatch.setenv("TELEGRAM_ALLOWED_ROOTS", f"{tmp_path / 'other'}{separator}{media}")
+    with pytest.raises(ValueError, match="outside"):
+        await migrate_session.migrate("secret", 123, "hash", str(media / "telegram"))
+    assert not media.exists()
+
+
+@pytest.mark.asyncio
+async def test_migrate_checks_dot_media_root_without_loading_client(monkeypatch, tmp_path):
+    import json
+
+    media = tmp_path / "media"
+    config = tmp_path / "access.json"
+    config.write_text(json.dumps({"media_root": str(media)}), encoding="utf-8")
+    monkeypatch.setenv("DOT_ACCESS_CONFIG", str(config))
+    with pytest.raises(ValueError, match="outside"):
+        await migrate_session.migrate("secret", 123, "hash", str(media / "telegram"))
+    assert not media.exists()
+
+
+@pytest.mark.asyncio
+async def test_migration_error_does_not_echo_source(monkeypatch, capsys):
+    source = "synthetic-source-session"
+    monkeypatch.setenv("TELEGRAM_SESSION_STRING", source)
+
+    async def rejected(*args):
+        raise ValueError(source)
+
+    monkeypatch.setattr(migrate_session, "migrate", rejected)
+    assert await migrate_session._run(SimpleNamespace(account=None, target=None)) == 1
+    assert source not in capsys.readouterr().err
+
+
+def test_failed_session_cleanup_preserves_replaced_file_and_symlink(tmp_path):
+    from telegram_mcp.private_session import create_private_session, remove_created_session
+
+    session = tmp_path / "telegram.session"
+    identity = create_private_session(session)
+    replacement = tmp_path / "replacement"
+    replacement.write_bytes(b"keep")
+    replacement.replace(session)
+    remove_created_session(session, identity)
+    assert session.read_bytes() == b"keep"
+    session.unlink()
+    session.symlink_to(replacement)
+    remove_created_session(session, identity)
+    assert session.is_symlink()
+
+
+def test_private_file_setup_fails_before_writes_on_native_windows(monkeypatch, tmp_path):
+    from telegram_mcp import private_session
+
+    target = tmp_path / "new" / "telegram.session"
+    with monkeypatch.context() as platform:
+        platform.setattr(private_session.os, "name", "nt")
+        with pytest.raises(ValueError, match="Windows ACLs are unverified"):
+            private_session.create_private_session(target)
+    assert not target.parent.exists()

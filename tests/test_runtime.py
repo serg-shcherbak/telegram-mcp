@@ -1457,7 +1457,7 @@ async def test_empty_client_roots_fallback_noop_without_server_roots(monkeypatch
 
     roots, status = await runtime._get_effective_allowed_roots_with_status(_ctx_with_roots([]))
     assert roots == []
-    assert status == runtime.ROOTS_STATUS_CLIENT_DENY_ALL
+    assert status == runtime.ROOTS_STATUS_NOT_CONFIGURED
 
 
 class _FailingRootsSession:
@@ -1521,7 +1521,7 @@ def test_coerce_paths_from_list_roots_validation_error_recovers_windows_paths():
 
 
 @pytest.mark.asyncio
-async def test_list_roots_validation_error_recovers_client_paths(tmp_path, monkeypatch):
+async def test_list_roots_validation_error_requires_server_paths(tmp_path, monkeypatch):
     from pydantic import ValidationError
     from mcp.types import ListRootsResult
 
@@ -1536,14 +1536,35 @@ async def test_list_roots_validation_error_recovers_client_paths(tmp_path, monke
     roots, status = await runtime._get_effective_allowed_roots_with_status(
         _ctx_with_list_roots_error(exc_info.value)
     )
-    assert status == runtime.ROOTS_STATUS_READY
-    assert roots == [root.resolve()]
+    assert status == runtime.ROOTS_STATUS_NOT_CONFIGURED
+    assert roots == []
 
     resolved, error = await runtime._ensure_allowed_roots(
         _ctx_with_list_roots_error(exc_info.value), "download_media"
     )
-    assert error is None
-    assert resolved == [root.resolve()]
+    assert error is not None
+    assert resolved == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outside", [False, True])
+async def test_recovered_client_roots_intersect_server_boundary(tmp_path, monkeypatch, outside):
+    from pydantic import ValidationError
+    from mcp.types import ListRootsResult
+
+    server = tmp_path / "server"
+    server.mkdir()
+    client = tmp_path / "outside" if outside else server / "child"
+    client.mkdir()
+    monkeypatch.setattr(runtime, "SERVER_ALLOWED_ROOTS", [server.resolve()])
+    monkeypatch.delenv("TELEGRAM_SERVER_ROOTS_ONLY", raising=False)
+    with pytest.raises(ValidationError) as exc_info:
+        ListRootsResult.model_validate({"roots": [{"uri": str(client)}]})
+    roots, status = await runtime._get_effective_allowed_roots_with_status(
+        _ctx_with_list_roots_error(exc_info.value)
+    )
+    assert status == runtime.ROOTS_STATUS_READY
+    assert roots == ([] if outside else [client.resolve()])
 
 
 @pytest.mark.asyncio
@@ -1694,7 +1715,7 @@ async def test_server_roots_only_ignores_client_roots_when_server_roots_set(tmp_
 
 
 @pytest.mark.asyncio
-async def test_server_roots_only_keeps_client_roots_without_server_roots(tmp_path, monkeypatch):
+async def test_server_roots_only_denies_without_server_roots(tmp_path, monkeypatch):
     client_root = tmp_path / "client"
     client_root.mkdir()
     monkeypatch.setattr(runtime, "SERVER_ALLOWED_ROOTS", [])
@@ -1703,12 +1724,12 @@ async def test_server_roots_only_keeps_client_roots_without_server_roots(tmp_pat
     roots, status = await runtime._get_effective_allowed_roots_with_status(
         _ctx_with_roots([SimpleNamespace(uri=client_root.as_uri())])
     )
-    assert status == runtime.ROOTS_STATUS_READY
-    assert roots == [client_root.resolve()]
+    assert status == runtime.ROOTS_STATUS_NOT_CONFIGURED
+    assert roots == []
 
 
 @pytest.mark.asyncio
-async def test_client_roots_still_replace_server_roots_by_default(tmp_path, monkeypatch):
+async def test_client_roots_cannot_replace_server_roots_by_default(tmp_path, monkeypatch):
     server_root = tmp_path / "server"
     client_root = tmp_path / "client"
     server_root.mkdir()
@@ -1720,7 +1741,7 @@ async def test_client_roots_still_replace_server_roots_by_default(tmp_path, monk
         _ctx_with_roots([SimpleNamespace(uri=client_root.as_uri())])
     )
     assert status == runtime.ROOTS_STATUS_READY
-    assert roots == [client_root.resolve()]
+    assert roots == []
 
 
 def test_get_file_extension_overrides_rejects_duplicate_tool_name():

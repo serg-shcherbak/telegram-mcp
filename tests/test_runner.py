@@ -399,15 +399,44 @@ async def test_serve_http_uses_default_host_and_port(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_serve_http_leaves_transport_security_unset_by_default(monkeypatch):
+@pytest.mark.parametrize("host", ["127.0.0.1", "0.0.0.0"])
+async def test_serve_http_enables_localhost_only_protection_by_default(monkeypatch, host):
+    """Host/Origin validation must be on even without MCP_ALLOWED_HOSTS.
+
+    Otherwise any web page in the user's browser could POST tool calls to the
+    local server (cross-origin request forgery / DNS rebinding).
+    """
     fake = _FakeMcp()
     monkeypatch.setattr(runner, "mcp", fake)
+    monkeypatch.setenv("MCP_HOST", host)
     monkeypatch.delenv("MCP_ALLOWED_HOSTS", raising=False)
     monkeypatch.delenv("MCP_ALLOWED_ORIGINS", raising=False)
 
     await runner._serve("http")
 
-    assert fake.settings.transport_security is None
+    security = fake.settings.transport_security
+    assert security.enable_dns_rebinding_protection is True
+    assert security.allowed_hosts == ["127.0.0.1:*", "localhost:*", "[::1]:*"]
+    assert security.allowed_origins == [
+        "http://127.0.0.1:*",
+        "http://localhost:*",
+        "http://[::1]:*",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_serve_http_allowed_origins_without_hosts_replace_local_origins(monkeypatch):
+    fake = _FakeMcp()
+    monkeypatch.setattr(runner, "mcp", fake)
+    monkeypatch.delenv("MCP_ALLOWED_HOSTS", raising=False)
+    monkeypatch.setenv("MCP_ALLOWED_ORIGINS", "http://localhost:3000")
+
+    await runner._serve("sse")
+
+    security = fake.settings.transport_security
+    assert security.enable_dns_rebinding_protection is True
+    assert security.allowed_hosts == ["127.0.0.1:*", "localhost:*", "[::1]:*"]
+    assert security.allowed_origins == ["http://localhost:3000"]
 
 
 @pytest.mark.asyncio
@@ -616,6 +645,46 @@ def test_lone_session_name_stays_required(monkeypatch):
 class _DialogsClient(_FakeClient):
     async def get_dialogs(self):
         return []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("actual_id,bot", [(2, False), (True, False), (1, True)])
+async def test_dot_numeric_owner_verification_rejects_other_accounts(monkeypatch, actual_id, bot):
+    client = _FakeClient(authorized=True)
+
+    async def get_me():
+        return SimpleNamespace(id=actual_id, bot=bot)
+
+    monkeypatch.setattr(client, "get_me", get_me)
+    monkeypatch.setattr(runner.mcp, "_dot_owner_id", 1, raising=False)
+    with pytest.raises(RuntimeError, match="configured owner"):
+        await runner._verify_expected_owner(client)
+    assert client.disconnected
+
+
+@pytest.mark.asyncio
+async def test_dot_does_not_warm_dialogs_during_startup(monkeypatch):
+    client = _DialogsClient(authorized=True)
+    dialogs = []
+
+    async def get_dialogs():
+        dialogs.append(True)
+        return []
+
+    async def connected(*args):
+        pass
+
+    async def serve(*args):
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(client, "get_dialogs", get_dialogs)
+    monkeypatch.setattr(runner, "clients", {"default": client})
+    monkeypatch.setattr(runner, "_connect_or_skip", connected)
+    monkeypatch.setattr(runner, "_serve", serve)
+    monkeypatch.setattr(runner.mcp, "_dot_access_config", "/synthetic/access.json", raising=False)
+    monkeypatch.setenv("MCP_TRANSPORT", "http")
+    await runner._main()
+    assert dialogs == []
 
 
 @pytest.mark.asyncio

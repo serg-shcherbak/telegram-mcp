@@ -9,6 +9,7 @@ import sqlite3
 import logging
 import mimetypes
 import unicodedata
+import inspect
 
 # Ensure sys.stderr is reconfigured for UTF-8 on Windows where possible
 if hasattr(sys.stderr, "reconfigure"):
@@ -17,6 +18,7 @@ if hasattr(sys.stderr, "reconfigure"):
     except Exception:
         pass
 from contextlib import contextmanager
+from contextvars import ContextVar
 from difflib import SequenceMatcher
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -72,6 +74,7 @@ from functools import wraps
 import telethon.errors.rpcerrorlist
 from sanitize import sanitize_user_content, sanitize_name, sanitize_dict, format_tool_result
 from telegram_mcp.client_identity import client_identity_kwargs
+from telegram_mcp.access import current_connection, effective_chat_scope
 
 
 class ValidationError(Exception):
@@ -105,11 +108,10 @@ def get_entity_type(entity: Any) -> str:
 
 def get_marked_id(entity: Any) -> int:
     """Return a Telethon-compatible marked ID for an entity."""
-    if isinstance(entity, Channel):
-        return -1000000000000 - entity.id
-    if isinstance(entity, Chat):
-        return -entity.id
-    return entity.id
+    try:
+        return utils.get_peer_id(entity)
+    except TypeError:
+        return entity.id
 
 
 def get_entity_filter_type(entity: Any) -> Optional[str]:
@@ -189,6 +191,7 @@ mcp = FastMCP("telegram", stateless_http=True)
 # annotations into the final CallToolResult, preserving structured output.
 _USER_AUDIENCE = Annotations(audience=["user"])
 TOOL_TIMEOUT_SECONDS_DEFAULT = 55.0
+_tool_deadline: ContextVar[Optional[float]] = ContextVar("tool_deadline", default=None)
 
 
 def _tool_timeout_seconds(value: Optional[str] = None) -> Optional[float]:
@@ -209,16 +212,19 @@ def _tool_timeout_seconds(value: Optional[str] = None) -> Optional[float]:
     return timeout if timeout > 0 else None
 
 
-def _install_annotation_hook() -> None:
+def _install_annotation_hook(server: Optional[FastMCP] = None) -> None:
     from mcp.types import CallToolRequest, ServerResult, CallToolResult
 
-    original_handler = mcp._mcp_server.request_handlers[CallToolRequest]
+    if server is None:
+        server = mcp
+    original_handler = server._mcp_server.request_handlers[CallToolRequest]
 
     async def annotated_handler(req):
         timeout = _tool_timeout_seconds()
         if timeout is None:
             response = await original_handler(req)
         else:
+            token = _tool_deadline.set(asyncio.get_running_loop().time() + timeout)
             try:
                 response = await asyncio.wait_for(original_handler(req), timeout=timeout)
             except asyncio.TimeoutError:
@@ -239,6 +245,8 @@ def _install_annotation_hook() -> None:
                         isError=True,
                     )
                 )
+            finally:
+                _tool_deadline.reset(token)
         if isinstance(response, ServerResult) and isinstance(response.root, CallToolResult):
             content = response.root.content
             if content:
@@ -253,7 +261,7 @@ def _install_annotation_hook() -> None:
                 ]
         return response
 
-    mcp._mcp_server.request_handlers[CallToolRequest] = annotated_handler
+    server._mcp_server.request_handlers[CallToolRequest] = annotated_handler
 
 
 _install_annotation_hook()
@@ -736,9 +744,7 @@ def _build_client(session: Any, label: str) -> TelegramClient:
 # Telegram forbids one auth key (one StringSession) being used from two IPs at
 # once; on a dual-stack / VPN host two local clients can egress via different
 # source IPs and collide. The fix is one authorized session PER concurrent
-# client (Telegram allows one account on many "devices"). Generate extra
-# sessions with `uv run session_string_generator.py` and list them in
-# TELEGRAM_SESSION_STRINGS (whitespace/comma/semicolon separated). Each process
+# client (Telegram allows one account on many "devices"). Each process
 # claims the first session not already locked by a live process via an advisory
 # flock, so clients deterministically pick distinct slots; the OS releases the
 # lock if a process dies.
@@ -799,9 +805,8 @@ def _acquire_session(pool: List[str]) -> str:
     raise RuntimeError(
         f"All {len(pool)} pooled Telegram session(s) are already claimed by other "
         "live clients, so this one has no session to use. Add another session to "
-        "TELEGRAM_SESSION_STRINGS (generate it with "
-        "`uv run session_string_generator.py`) — one slot per concurrent client — "
-        "or stop one of the other clients."
+        "the existing legacy TELEGRAM_SESSION_STRINGS pool, clear the pool and use a "
+        "distinct private TELEGRAM_SESSION_NAME file, or stop one of the other clients."
     )
 
 
@@ -855,15 +860,14 @@ def _discover_accounts() -> dict[str, TelegramClient]:
         elif session_name:
             accounts["default"] = _build_client(_resolve_session_path(session_name), "default")
             if len(accounts) > 1:
-                # The Docker image and .env.example preset TELEGRAM_SESSION_NAME, so next to
-                # labelled accounts it often names a session nobody logged in to. The runner
-                # skips such a default account instead of refusing to start.
+                # Preserve labeled-account startup with an uninitialized legacy default file.
                 OPTIONAL_ACCOUNTS.add("default")
 
     if not accounts:
         print(
             "Error: No Telegram session configured. "
-            "Set TELEGRAM_SESSION_STRING or TELEGRAM_SESSION_STRING_<LABEL> in .env",
+            "Set TELEGRAM_SESSION_NAME or TELEGRAM_SESSION_NAME_<LABEL> to an existing "
+            "private file session; existing legacy StringSessions are also supported.",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -976,11 +980,11 @@ async def _force_reconnect(cl: TelegramClient):
         # once, so retrying here can never succeed — surface it instead of
         # letting the caller sit in a reconnect loop.
         raise RuntimeError(
-            "Telegram session is no longer usable: the same session string was "
+            "Telegram session is no longer usable: the same authorization was "
             "used by another client at the same time (AuthKeyDuplicatedError). "
-            "Give each concurrent client its own session via "
-            "TELEGRAM_SESSION_STRINGS or TELEGRAM_SESSION_STRING_<LABEL>, then "
-            "regenerate the burned session with `uv run session_string_generator.py`."
+            "Stop the affected process and create a new private session with "
+            "`uv run session_string_generator.py`; set the printed "
+            "TELEGRAM_SESSION_NAME[_<LABEL>]. Give concurrent clients distinct sessions."
         ) from exc
     except asyncio.TimeoutError as exc:
         raise RuntimeError(
@@ -994,8 +998,9 @@ async def _force_reconnect(cl: TelegramClient):
         except Exception:
             pass
         raise RuntimeError(
-            "Telegram session is not authorized after reconnect. Re-authorize it "
-            "outside the server (session_string_generator.py) and restart."
+            "Telegram session is not authorized after reconnect. Stop the server, "
+            "create a new private session (session_string_generator.py), and restart "
+            "with its printed TELEGRAM_SESSION_NAME[_<LABEL>]."
         )
     _last_conn_verified[id(cl)] = time.time()
     reconnect_logger.warning("Forced reconnect successful")
@@ -1147,23 +1152,35 @@ ROOTS_REQUEST_TIMEOUT_DEFAULT = 10.0
 
 # Per-chat access control allowlist configuration (TELEGRAM_ALLOWED_CHAT_IDS)
 ALLOWED_CHAT_IDS: Optional[set[Union[int, str]]] = None
+# A marked chat ID: optional minus sign, digits only. A leading "+" is a phone
+# number, not an ID, and must go through entity resolution instead.
+_NUMERIC_CHAT_ID_RE = re.compile(r"-?\d+")
 # Every parameter that names a chat the tool reads or changes, whatever it is called:
 # contact_id is the private chat with that contact, group_id the group being administered.
 # user_id stays out: it names a member acted on inside an already-checked chat.
 CHAT_PARAM_NAMES: frozenset[str] = frozenset(
     {"chat_id", "from_chat_id", "to_chat_id", "channel", "contact_id", "group_id"}
 )
+_chat_resolution_targets: ContextVar[Optional[tuple[Any, ...]]] = ContextVar(
+    "chat_resolution_targets", default=None
+)
 
 
 def _parse_allowed_chat_ids(
     raw: Optional[Union[str, Iterable[Union[int, str]]]],
 ) -> Optional[set[Union[int, str]]]:
-    """Parse TELEGRAM_ALLOWED_CHAT_IDS into a set of allowed IDs and usernames.
+    """Parse TELEGRAM_ALLOWED_CHAT_IDS into a set of allowed marked IDs and usernames.
 
-    Supports comma-separated integer IDs (e.g. '12345678,-100123456789') and
-    usernames/handles (e.g. '@mychat,other_channel').
-    Also automatically indexes marked variants for bare integers and vice versa
-    so that both marked IDs (-100...) and bare positive IDs match.
+    Supports comma-separated integer IDs and usernames/handles, e.g.
+    '12345678,-100123456789,-4567,@mychat'. Integer IDs are taken in Telegram's
+    marked (Bot API) form, the form every tool returns as ``chat_id``: a user is
+    ``12345678``, a basic group ``-4567`` and a channel/supergroup
+    ``-100123456789``.
+
+    Users, basic groups and channels have separate ID namespaces, so the same
+    bare number can name unrelated chats of different types. Each entry is kept
+    exactly as written and never widened to other peer types: allowing channel
+    ``-100123456789`` must not also allow user ``123456789``.
     """
     if raw is None:
         return None
@@ -1182,27 +1199,12 @@ def _parse_allowed_chat_ids(
 
     allowed: set[Union[int, str]] = set()
     for token in tokens:
-        try:
-            val = int(token)
-            allowed.add(val)
-            # If negative supergroup: -100XXXXXXXXXX
-            if str(val).startswith("-100") and len(str(val)) > 4:
-                try:
-                    channel_id = int(str(val)[4:])
-                    allowed.add(channel_id)
-                except ValueError:
-                    pass
-            # If positive bare ID: add supergroup (-100...) and group (-) variants
-            elif val > 0:
-                allowed.add(-1000000000000 - val)
-                allowed.add(-val)
-            elif val < 0:
-                # Basic group negative ID: -XXXXXX
-                allowed.add(-val)
-        except ValueError:
-            clean_handle = token.lstrip("@").strip().lower()
-            if clean_handle:
-                allowed.add(clean_handle)
+        if _NUMERIC_CHAT_ID_RE.fullmatch(token):
+            allowed.add(int(token))
+            continue
+        clean_handle = token.lstrip("@").strip().lower()
+        if clean_handle:
+            allowed.add(clean_handle)
 
     return allowed if allowed else None
 
@@ -1220,8 +1222,8 @@ def get_effective_allowed_chat_ids() -> Optional[set[Union[int, str]]]:
     """Return the currently effective set of allowed chat IDs, or None if allowlist is disabled."""
     env_raw = os.getenv("TELEGRAM_ALLOWED_CHAT_IDS")
     if env_raw is not None:
-        return _parse_allowed_chat_ids(env_raw)
-    return ALLOWED_CHAT_IDS
+        return effective_chat_scope(_parse_allowed_chat_ids(env_raw))
+    return effective_chat_scope(ALLOWED_CHAT_IDS)
 
 
 def is_chat_allowlist_enabled() -> bool:
@@ -1232,37 +1234,38 @@ def is_chat_allowlist_enabled() -> bool:
 def is_chat_allowed(chat_identifier: Any, entity: Any = None) -> bool:
     """Check whether a chat identifier or entity is permitted by the allowlist.
 
+    Integer identifiers are compared as marked IDs (see
+    ``_parse_allowed_chat_ids``); an entity is compared by its marked ID and
+    username only. Its bare ``id`` is never used: the same number is a
+    different chat in the user, basic-group and channel namespaces.
+
     If allowlist is not enabled, always returns True.
     """
     allowed = get_effective_allowed_chat_ids()
     if allowed is None:
         return True
 
-    if chat_identifier is not None:
+    if entity is None and chat_identifier is not None and not isinstance(chat_identifier, bool):
         if isinstance(chat_identifier, int):
             if chat_identifier in allowed:
                 return True
         elif isinstance(chat_identifier, str):
-            try:
-                int_id = int(chat_identifier)
-                if int_id in allowed:
+            ident = chat_identifier.strip()
+            if _NUMERIC_CHAT_ID_RE.fullmatch(ident):
+                if int(ident) in allowed:
                     return True
-            except ValueError:
-                clean = chat_identifier.lstrip("@").strip().lower()
+            else:
+                clean = ident.lstrip("@").strip().lower()
                 if clean and clean in allowed:
                     return True
 
     if entity is not None:
         try:
             marked_id = get_marked_id(entity)
-            if marked_id in allowed:
+            if not isinstance(marked_id, bool) and marked_id in allowed:
                 return True
         except Exception:
             pass
-
-        bare_id = getattr(entity, "id", None)
-        if isinstance(bare_id, int) and bare_id in allowed:
-            return True
 
         username = getattr(entity, "username", None)
         if username and str(username).lower() in allowed:
@@ -1274,6 +1277,8 @@ def is_chat_allowed(chat_identifier: Any, entity: Any = None) -> bool:
 def check_chat_access(chat_identifier: Any, entity: Any = None) -> Optional[str]:
     """Return an error message if chat access is restricted, or None if allowed."""
     if not is_chat_allowed(chat_identifier, entity):
+        if current_connection.get() is not None:
+            return "Access to the requested source is restricted by connection policy."
         return (
             f"Access to chat '{chat_identifier}' is restricted by privacy policy "
             "(TELEGRAM_ALLOWED_CHAT_IDS)."
@@ -1360,6 +1365,11 @@ def log_and_format_error(
     if isinstance(error, AliasNeedsUser):
         return error.payload
 
+    def result(message):
+        if current_connection.get() is not None:
+            raise ToolError(message)
+        return message
+
     # Generate a consistent error code
     if isinstance(prefix, str) and prefix == "VALIDATION-001":
         # Special case for validation errors
@@ -1386,9 +1396,9 @@ def log_and_format_error(
         seconds = getattr(error, "seconds", None) or 0
         logger.warning("Telegram FloodWait; retry only after the reported delay.")
         if user_message:
-            return user_message
+            return result(user_message)
         wait_clause = f"{seconds} seconds" if seconds > 0 else "an unknown duration"
-        return (
+        return result(
             f"Rate limit exceeded (FloodWait): Telegram requires waiting {wait_clause} "
             f"before repeating this operation. Do NOT retry immediately (code: {error_code})."
         )
@@ -1399,7 +1409,7 @@ def log_and_format_error(
 
     # Return a user-friendly message
     if user_message:
-        return user_message
+        return result(user_message)
 
     # MTProto schema drift must not hide behind the generic code. Telethon releases lag
     # behind production Telegram, and when the server sends an object whose constructor
@@ -1407,7 +1417,7 @@ def log_and_format_error(
     # while their neighbours keep working. Reported as a generic error, that pattern is
     # indistinguishable from "no such user/chat" and sends debugging the wrong way.
     if _is_schema_drift(error):
-        return (
+        return result(
             f"MTProto schema mismatch: the installed Telethon does not know an object the "
             f"server sent. This is NOT a missing user or chat — the data arrived, "
             f"parsing it failed. Upgrade Telethon; if it is already the latest release, its "
@@ -1421,9 +1431,9 @@ def log_and_format_error(
         reported = (
             f"{telegram_name} ({type(error).__name__})" if telegram_name else type(error).__name__
         )
-        return f"An error occurred (code: {error_code}): Telegram returned {reported}."
+        return result(f"An error occurred (code: {error_code}): Telegram returned {reported}.")
 
-    return f"An error occurred (code: {error_code})."
+    return result(f"An error occurred (code: {error_code}).")
 
 
 def validate_id(*param_names_to_validate, raise_errors=False):
@@ -1441,8 +1451,22 @@ def validate_id(*param_names_to_validate, raise_errors=False):
         return message
 
     def decorator(func):
+        signature = inspect.signature(func)
+        extra_name = next(
+            (
+                name
+                for name, param in signature.parameters.items()
+                if param.kind == param.VAR_KEYWORD
+            ),
+            None,
+        )
+
         @wraps(func)
         async def wrapper(*args, **kwargs):
+            bound = signature.bind(*args, **kwargs)
+            kwargs = dict(bound.arguments)
+            extra = kwargs.pop(extra_name, {}) if extra_name else {}
+            kwargs.update(extra)
             for param_name in param_names_to_validate:
                 if param_name not in kwargs or kwargs[param_name] is None:
                     continue
@@ -1451,7 +1475,7 @@ def validate_id(*param_names_to_validate, raise_errors=False):
 
                 def validate_single_id(value, p_name):
                     # Handle integer IDs
-                    if isinstance(value, int):
+                    if isinstance(value, int) and not isinstance(value, bool):
                         if not (-(2**63) <= value <= 2**63 - 1):
                             return (
                                 None,
@@ -1462,6 +1486,9 @@ def validate_id(*param_names_to_validate, raise_errors=False):
 
                     # Handle string IDs
                     if isinstance(value, str):
+                        value = value.strip()
+                        if value.startswith("+") and value[1:].isdigit():
+                            return value, None
                         try:
                             int_value = int(value)
                             if not (-(2**63) <= int_value <= 2**63 - 1):
@@ -1552,7 +1579,23 @@ def validate_id(*param_names_to_validate, raise_errors=False):
                                     )
                                 )
 
-            return await func(*args, **kwargs)
+            for name in param_names_to_validate:
+                if name in kwargs:
+                    if name in extra:
+                        extra[name] = kwargs[name]
+                    else:
+                        bound.arguments[name] = kwargs[name]
+            targets = tuple(
+                item
+                for name in param_names_to_validate
+                if name in CHAT_PARAM_NAMES and kwargs.get(name) is not None
+                for item in (kwargs[name] if isinstance(kwargs[name], list) else [kwargs[name]])
+            )
+            token = _chat_resolution_targets.set(targets or _chat_resolution_targets.get())
+            try:
+                return await func(*bound.args, **bound.kwargs)
+            finally:
+                _chat_resolution_targets.reset(token)
 
         return wrapper
 
@@ -2071,8 +2114,16 @@ def alias_ask_payload(reference: str, kind: str = "unknown", stored_id: Optional
     Server-authored text interpolating only the caller's own reference; any
     Telegram-supplied name stays quarantined inside the candidates list.
     """
-    matches = match_aliases(reference)
-    known = sorted(load_aliases())[:20]
+    matches = [
+        (alias, record)
+        for alias, record in match_aliases(reference)
+        if is_chat_allowed(record["id"])
+    ]
+    known = sorted(
+        alias for alias, record in load_aliases().items() if is_chat_allowed(record["id"])
+    )[:20]
+    if stored_id is not None and not is_chat_allowed(stored_id):
+        kind, stored_id = "unknown", None
     candidates = [
         {"alias": alias, "id": record["id"], "name": record.get("name")}
         for alias, record in matches[:5]
@@ -2164,16 +2215,18 @@ async def _resolve_with_retries(
     """
     await ensure_connected(client)
     get = getattr(client, getter)
+    scoped = current_connection.get() is not None or is_chat_allowlist_enabled()
     last_error = None
     try:
         try:
             return await get(identifier)
         except ValueError as error:
             last_error = error
-            try:
-                await client.get_dialogs()
-            except (BotMethodInvalidError, Exception):
-                pass
+            if not scoped:
+                try:
+                    await client.get_dialogs()
+                except (BotMethodInvalidError, Exception):
+                    pass
             try:
                 return await get(identifier)
             except ValueError as error:
@@ -2184,25 +2237,25 @@ async def _resolve_with_retries(
             return await get(identifier)
         except ValueError as error:
             last_error = error
-            try:
-                await client.get_dialogs()
-            except (BotMethodInvalidError, Exception):
-                pass
+            if not scoped:
+                try:
+                    await client.get_dialogs()
+                except (BotMethodInvalidError, Exception):
+                    pass
             try:
                 return await get(identifier)
             except ValueError as error:
                 last_error = error
 
-    if try_marked:
-        for candidate in _marked_id_candidates(identifier):
-            try:
-                return await get(candidate)
-            except ValueError as error:
-                last_error = error
+    candidates = _marked_id_candidates(identifier) if try_marked and not scoped else []
+    for candidate in candidates:
+        try:
+            return await get(candidate)
+        except ValueError as error:
+            last_error = error
 
     raise ValueError(
-        f"Could not resolve {label} for {identifier!r}, "
-        f"including marked variants {_marked_id_candidates(identifier)}"
+        f"Could not resolve {label} for {identifier!r}, including marked variants {candidates}"
     ) from last_error
 
 
@@ -2220,9 +2273,18 @@ async def _resolve(getter: str, identifier: Union[int, str], client, label: str)
         # An id that came from a saved alias is exact; guessing marked variants of
         # it could deliver to a completely unrelated chat.
         from_alias = identifier is not original
-        return await _resolve_with_retries(
+        entity = await _resolve_with_retries(
             getter, identifier, client, label, try_marked=not from_alias
         )
+        targets = _chat_resolution_targets.get()
+        if is_chat_allowlist_enabled() and (
+            targets is None or original in targets or identifier in targets
+        ):
+            source = await client.get_me() if isinstance(entity, types.InputPeerSelf) else entity
+            error = check_chat_access(original, source)
+            if error:
+                raise ChatAccessDeniedError(error)
+        return entity
     except (ValueError, *_PEER_ERRORS) as error:
         # An unknown or stale nickname is a question for the user, not a dead end:
         # report the wording they used, never the opaque stored id.
@@ -2533,11 +2595,22 @@ async def _get_effective_allowed_roots_with_status(
     ctx: Optional[Context],
 ) -> tuple[List[Path], str]:
     fallback_roots = list(SERVER_ALLOWED_ROOTS)
-    if ctx is None:
-        if fallback_roots:
-            return fallback_roots, ROOTS_STATUS_READY
+    if not fallback_roots:
         return [], ROOTS_STATUS_NOT_CONFIGURED
-    if fallback_roots and _server_roots_only_enabled():
+
+    def intersect(client_roots):
+        return _dedupe_paths(
+            [
+                client if client.is_relative_to(server) else server
+                for client in client_roots
+                for server in fallback_roots
+                if client.is_relative_to(server) or server.is_relative_to(client)
+            ]
+        )
+
+    if ctx is None:
+        return fallback_roots, ROOTS_STATUS_READY
+    if _server_roots_only_enabled():
         return fallback_roots, ROOTS_STATUS_SERVER_ONLY
 
     try:
@@ -2547,7 +2620,7 @@ async def _get_effective_allowed_roots_with_status(
         else:
             list_roots_result = await asyncio.wait_for(ctx.session.list_roots(), timeout)
     except asyncio.TimeoutError:
-        if fallback_roots and _server_roots_fallback_enabled():
+        if _server_roots_fallback_enabled():
             logger.warning(
                 "MCP client did not answer roots/list before the configured timeout "
                 "(TELEGRAM_ROOTS_TIMEOUT_SECONDS); falling back to server CLI roots "
@@ -2564,14 +2637,12 @@ async def _get_effective_allowed_roots_with_status(
         recovered_roots = _coerce_paths_from_list_roots_validation_error(error)
         if recovered_roots:
             logger.warning("MCP client returned non-URI roots; recovered validated paths.")
-            return recovered_roots, ROOTS_STATUS_READY
+            return intersect(recovered_roots), ROOTS_STATUS_READY
         if _is_roots_unsupported_error(error):
-            if fallback_roots:
-                return fallback_roots, ROOTS_STATUS_UNSUPPORTED_FALLBACK
-            return [], ROOTS_STATUS_NOT_CONFIGURED
+            return fallback_roots, ROOTS_STATUS_UNSUPPORTED_FALLBACK
         # Unexpected list_roots failures (e.g. malformed client payloads that we
         # could not recover). Match empty-list behavior: opt-in server fallback.
-        if fallback_roots and _server_roots_fallback_enabled():
+        if _server_roots_fallback_enabled():
             logger.warning(
                 "MCP roots request failed; falling back to server CLI roots "
                 "(TELEGRAM_ALLOW_SERVER_ROOTS_FALLBACK).",
@@ -2589,14 +2660,14 @@ async def _get_effective_allowed_roots_with_status(
             continue
 
     if client_roots:
-        return _dedupe_paths(client_roots), ROOTS_STATUS_READY
+        return intersect(client_roots), ROOTS_STATUS_READY
 
     # Roots API succeeded but returned an empty list. By default this is an
     # explicit deny-all. Some clients (e.g. ones that implement the Roots
     # capability but expose no roots) advertise an empty list even though the
     # operator configured server-side CLI roots; for those, an opt-in lets the
     # server-side roots take effect instead of disabling file tools entirely.
-    if fallback_roots and _server_roots_fallback_enabled():
+    if _server_roots_fallback_enabled():
         return fallback_roots, ROOTS_STATUS_SERVER_FALLBACK
     return [], ROOTS_STATUS_CLIENT_DENY_ALL
 

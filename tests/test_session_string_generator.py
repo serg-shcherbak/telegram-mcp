@@ -246,7 +246,7 @@ def test_parse_args_rejects_conflicting_login_modes(monkeypatch):
 
 class _AuthorizedClient:
     def __init__(self, *args, **kwargs):
-        self.session = object()
+        self.session = args[0]
         self.disconnected = False
 
     def connect(self):
@@ -259,65 +259,98 @@ class _AuthorizedClient:
         self.disconnected = True
 
 
-class _FakeStringSession:
-    def __init__(self, *args):
-        pass
+@pytest.fixture
+def private_login(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.delenv("TELEGRAM_SESSION_NAME", raising=False)
+    monkeypatch.delenv("DOT_ACCESS_CONFIG", raising=False)
+    monkeypatch.delenv("TELEGRAM_ALLOWED_ROOTS", raising=False)
+    monkeypatch.setenv("TELEGRAM_API_ID", "1")
+    monkeypatch.setenv("TELEGRAM_API_HASH", "hash")
+    monkeypatch.setattr("sys.argv", ["session_string_generator.py", "--qr"])
+    monkeypatch.setattr(session_string_generator, "_harden_stdio", lambda: None)
+    monkeypatch.setattr(session_string_generator, "_check_installation", lambda: None)
+    monkeypatch.setattr(session_string_generator, "client_identity_kwargs", dict)
+    monkeypatch.setattr(session_string_generator, "TelegramClient", _AuthorizedClient)
+    monkeypatch.setattr("builtins.input", lambda _prompt="": "")
+    return tmp_path / "state" / "telegram-mcp" / "sessions" / "telegram_mcp_session.session"
 
-    @staticmethod
-    def save(session):
-        return "NEWSESSION"
 
-
-def test_env_update_keeps_utf8_file_under_windows_locale(monkeypatch, tmp_path):
-    # .env is UTF-8 (python-dotenv reads it that way); the update must not fall
-    # back to the locale encoding, here cp1252 as on an English Windows install.
-    real_open = open
-
-    def locale_open(file, mode="r", *args, encoding=None, **kwargs):
-        if "b" not in mode and encoding is None:
-            encoding = "cp1252"
-        return real_open(file, mode, *args, encoding=encoding, **kwargs)
-
+def test_login_persists_private_native_session_without_secret_output(
+    monkeypatch, tmp_path, capsys, private_login
+):
     env_file = tmp_path / ".env"
     original = "# Настройки Telegram\nTELEGRAM_API_ID=1\n"
     env_file.write_text(original, encoding="utf-8")
-
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(session_string_generator, "open", locale_open, raising=False)
-    monkeypatch.setattr("sys.argv", ["session_string_generator.py", "--qr"])
-    monkeypatch.setenv("TELEGRAM_API_ID", "1")
-    monkeypatch.setenv("TELEGRAM_API_HASH", "hash")
-    monkeypatch.setattr(session_string_generator, "_harden_stdio", lambda: None)
-    monkeypatch.setattr(session_string_generator, "_check_installation", lambda: None)
-    monkeypatch.setattr(session_string_generator, "client_identity_kwargs", dict)
-    monkeypatch.setattr(session_string_generator, "TelegramClient", _AuthorizedClient)
-    monkeypatch.setattr(session_string_generator, "StringSession", _FakeStringSession)
-    answers = iter(["", "y"])
-    monkeypatch.setattr("builtins.input", lambda _prompt="": next(answers))
+    writes = []
 
-    session_string_generator.main()
+    class NativeSession:
+        def __init__(self, name):
+            target = private_login
+            writes.append((target.stat().st_mode & 0o777, target.parent.stat().st_mode & 0o777))
+            target.write_bytes(b"synthetic-auth-material")
 
-    assert env_file.read_text(encoding="utf-8") == (
-        original + "TELEGRAM_SESSION_STRING=NEWSESSION\n"
-    )
+        def save(self):
+            pass
 
+        def close(self):
+            pass
 
-def test_dash_account_label_suggests_shell_safe_env_var(monkeypatch, capsys):
-    # The suggested variable must be the one the migrator and the server read:
-    # `export TELEGRAM_SESSION_STRING_MY-WORK=...` is not valid shell syntax.
-    monkeypatch.setattr("sys.argv", ["session_string_generator.py", "--qr"])
-    monkeypatch.setenv("TELEGRAM_API_ID", "1")
-    monkeypatch.setenv("TELEGRAM_API_HASH", "hash")
-    monkeypatch.setattr(session_string_generator, "_harden_stdio", lambda: None)
-    monkeypatch.setattr(session_string_generator, "_check_installation", lambda: None)
-    monkeypatch.setattr(session_string_generator, "client_identity_kwargs", dict)
-    monkeypatch.setattr(session_string_generator, "TelegramClient", _AuthorizedClient)
-    monkeypatch.setattr(session_string_generator, "StringSession", _FakeStringSession)
-    answers = iter(["my-work", "n"])
-    monkeypatch.setattr("builtins.input", lambda _prompt="": next(answers))
-
+    monkeypatch.setattr(session_string_generator, "SQLiteSession", NativeSession, raising=False)
     session_string_generator.main()
 
     out = capsys.readouterr().out
-    assert "TELEGRAM_SESSION_STRING_MY_WORK=NEWSESSION" in out
+    assert "synthetic-auth-material" not in out
+    assert f"TELEGRAM_SESSION_NAME={private_login.with_suffix('')}" in out
+    assert writes == [(0o600, 0o700)]
+    assert private_login.read_bytes() == b"synthetic-auth-material"
+    assert env_file.read_text(encoding="utf-8") == original
+
+
+def test_dash_account_label_suggests_shell_safe_native_env_var(monkeypatch, capsys, private_login):
+    monkeypatch.setattr("builtins.input", lambda _prompt="": "my-work")
+    session_string_generator.main()
+
+    out = capsys.readouterr().out
+    assert "TELEGRAM_SESSION_NAME_MY_WORK=" in out
+    assert "TELEGRAM_SESSION_STRING" not in out
+    assert "synthetic-auth-material" not in out
     assert "MY-WORK" not in out
+
+
+def test_login_cancellation_removes_only_new_session(monkeypatch, private_login):
+    class CancelledClient(_AuthorizedClient):
+        def connect(self):
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(session_string_generator, "TelegramClient", CancelledClient)
+    with pytest.raises(KeyboardInterrupt):
+        session_string_generator.main()
+    assert not private_login.exists()
+
+
+def test_login_refuses_existing_session_without_connecting(monkeypatch, private_login):
+    private_login.parent.mkdir(parents=True, mode=0o700)
+    private_login.write_bytes(b"existing-session")
+    calls = []
+    monkeypatch.setattr(
+        session_string_generator, "TelegramClient", lambda *a, **kw: calls.append(a)
+    )
+    with pytest.raises(SystemExit):
+        session_string_generator.main()
+    assert private_login.read_bytes() == b"existing-session"
+    assert calls == []
+
+
+def test_login_failure_does_not_echo_auth_material(monkeypatch, capsys, private_login):
+    class FailedClient(_AuthorizedClient):
+        def connect(self):
+            raise RuntimeError("synthetic-auth-material")
+
+    monkeypatch.setattr(session_string_generator, "TelegramClient", FailedClient)
+    with pytest.raises(SystemExit):
+        session_string_generator.main()
+    captured = capsys.readouterr()
+    assert "synthetic-auth-material" not in captured.out + captured.err
+    assert not private_login.exists()

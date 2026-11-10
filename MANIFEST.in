@@ -1,0 +1,13 @@
+global-exclude .env* *.env *.env.* *.session* *.sqlite* *.db* *.bak *.backup *~ *.log *.pyc
+global-exclude aliases.json incoming_feed.jsonl access.json*
+prune state
+prune sessions
+prune transcripts
+prune cache
+prune .cache
+prune logs
+prune data
+prune media
+prune audio
+prune backups
+recursive-exclude * state/* sessions/* transcripts/* cache/* .cache/* logs/* data/* media/* audio/* backups/* __pycache__/*

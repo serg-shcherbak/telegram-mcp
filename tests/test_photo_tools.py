@@ -73,14 +73,14 @@ async def test_list_photos_sanitizes_captions(patched_media):
     patched_media.setattr(media, "list_photo_references", _list)
     patched_media.setattr(media, "sanitize_user_content", lambda text, max_length: "SANITIZED")
 
-    indexed = json.loads(await media.list_photos("chat", source="messages"))
+    indexed = json.loads(await media.list_photos(123, source="messages"))
 
     assert indexed["photos"][0]["caption"] == "SANITIZED"
 
 
 @pytest.mark.asyncio
 async def test_list_photos_rejects_an_unknown_source_without_calling_telegram(patched_media):
-    result = await media.list_photos("chat", source="stories")
+    result = await media.list_photos(123, source="stories")
 
     assert "Unknown photo source" in result
     assert "avatars" in result
@@ -120,7 +120,7 @@ async def test_open_photo_with_message_id_selects_the_message_source(patched_med
         media, "download_photo_bytes", lambda cl, ref, thumbnail=False: _async(_jpeg_bytes())
     )
 
-    await media.open_photo("chat", message_id=9001)
+    await media.open_photo(123, message_id=9001)
 
     assert seen == {"source": "messages", "identifier": 9001}
 
@@ -144,7 +144,7 @@ async def test_open_photo_fetches_and_downloads_only_the_requested_message(patch
     client = SinglePhotoClient()
     patched_media.setattr(media, "get_client", lambda account=None: client)
 
-    result = await media.open_photo("chat", message_id=9001)
+    result = await media.open_photo(123, message_id=9001)
 
     assert isinstance(result, Image)
     assert result.data == _jpeg_bytes()

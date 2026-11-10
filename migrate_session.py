@@ -15,6 +15,12 @@ from telethon.sessions import SQLiteSession, StringSession
 from telegram_mcp.account_labels import canonical_account_label
 from telegram_mcp.client_identity import client_identity_kwargs
 from telegram_mcp.install_guard import UnsafeInstallationError, assert_safe_distribution
+from telegram_mcp.private_session import (
+    create_private_session,
+    default_session_target,
+    remove_created_session,
+    session_paths,
+)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -37,7 +43,7 @@ def _parse_args() -> argparse.Namespace:
         metavar="PATH",
         help=(
             "Destination session name or path, without the .session suffix. "
-            "Defaults to TELEGRAM_SESSION_NAME[_<LABEL>] or telegram_mcp_session[_<label>]."
+            "Defaults to TELEGRAM_SESSION_NAME[_<LABEL>] or a private XDG state directory."
         ),
     )
     return parser.parse_args()
@@ -73,11 +79,7 @@ def _env_names(account: Optional[str]) -> tuple[str, str, str]:
 
 def _target_paths(target: str) -> tuple[str, Path]:
     """Return the Telethon session name and its resulting SQLite filename."""
-    expanded = Path(target).expanduser()
-    if expanded.name.endswith(".session"):
-        expanded = expanded.with_name(expanded.name[: -len(".session")])
-    session_name = str(expanded)
-    return session_name, Path(f"{session_name}.session").resolve()
+    return session_paths(target)
 
 
 async def migrate(
@@ -88,13 +90,10 @@ async def migrate(
 ) -> tuple[Path, object]:
     """Copy auth material into a new SQLite session and verify it with Telegram."""
     session_name, session_file = _target_paths(target)
-    if session_file.exists():
-        raise FileExistsError(
-            f"destination already exists: {session_file}. Choose another --target."
-        )
-
+    identity = create_private_session(session_file)
     sqlite_session = None
     client = None
+    completed = False
     try:
         source = StringSession(session_string)
         sqlite_session = SQLiteSession(session_name)
@@ -112,21 +111,20 @@ async def migrate(
         if not await client.is_user_authorized():
             raise RuntimeError("the source session is not authorized")
         user = await client.get_me()
-    except Exception:
-        if client is not None:
-            await client.disconnect()
-        elif sqlite_session is not None:
-            sqlite_session.close()
-        session_file.unlink(missing_ok=True)
-        raise
-    else:
         await client.disconnect()
-
-    try:
-        session_file.chmod(0o600)
-    except OSError:
-        # Some filesystems do not implement POSIX permissions.
-        pass
+        client = None
+        completed = True
+    finally:
+        try:
+            if client is not None:
+                await client.disconnect()
+        finally:
+            try:
+                if sqlite_session is not None:
+                    sqlite_session.close()
+            finally:
+                if not completed:
+                    remove_created_session(session_file, identity)
     return session_file, user
 
 
@@ -153,17 +151,15 @@ async def _run(args: argparse.Namespace) -> int:
         print(f"Error: {string_env} must be set", file=sys.stderr)
         return 1
 
-    target = args.target or os.getenv(name_env) or default_target
     try:
-        session_file, user = await migrate(session_string, api_id, api_hash, target)
+        target = args.target or os.getenv(name_env) or default_session_target(default_target)
+        session_file, _user = await migrate(session_string, api_id, api_hash, target)
     except Exception as exc:
-        print(f"Migration failed: {exc}", file=sys.stderr)
+        print(f"Migration failed ({type(exc).__name__}); source unchanged", file=sys.stderr)
         return 1
 
-    display_name = getattr(user, "first_name", None) or "Telegram user"
-    user_id = getattr(user, "id", "unknown")
     session_name = str(session_file.with_suffix(""))
-    print(f"Migration successful: {display_name} (id={user_id})")
+    print("Migration successful")
     print(f"Created {session_file}")
     print("\nUpdate your environment:")
     print(f"  {name_env}={session_name}")

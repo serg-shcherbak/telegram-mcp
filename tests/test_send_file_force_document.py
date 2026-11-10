@@ -37,12 +37,12 @@ def client_and_root(tmp_path, monkeypatch):
 async def test_single_file_omits_force_document_by_default(client_and_root):
     client, root = client_and_root
 
-    result = await media.send_file("Chat", "shot.png", caption="cap")
+    result = await media.send_file(123, "shot.png", caption="cap")
 
-    assert result == f"File sent to chat Chat from {root / 'shot.png'}."
+    assert result == f"File sent to chat 123 from {root / 'shot.png'}."
     assert client.calls == [
         {
-            "entity": "entity:Chat",
+            "entity": "entity:123",
             "file": str(root / "shot.png"),
             "caption": "cap",
             "reply_to": None,
@@ -55,12 +55,12 @@ async def test_single_file_omits_force_document_by_default(client_and_root):
 async def test_single_file_force_document_true_is_passed_through(client_and_root):
     client, root = client_and_root
 
-    result = await media.send_file("Chat", "shot.png", caption="cap", force_document=True)
+    result = await media.send_file(123, "shot.png", caption="cap", force_document=True)
 
-    assert result == f"File sent to chat Chat from {root / 'shot.png'}."
+    assert result == f"File sent to chat 123 from {root / 'shot.png'}."
     assert client.calls == [
         {
-            "entity": "entity:Chat",
+            "entity": "entity:123",
             "file": str(root / "shot.png"),
             "caption": "cap",
             "reply_to": None,
@@ -74,9 +74,9 @@ async def test_single_file_force_document_true_is_passed_through(client_and_root
 async def test_album_omits_force_document_by_default(client_and_root):
     client, root = client_and_root
 
-    result = await media.send_file("Chat", ["one.png", "two.png"])
+    result = await media.send_file(123, ["one.png", "two.png"])
 
-    assert result == "Album sent to chat Chat with 2 files."
+    assert result == "Album sent to chat 123 with 2 files."
     assert "force_document" not in client.calls[0]
     assert client.calls[0]["file"] == [str(root / "one.png"), str(root / "two.png")]
 
@@ -86,13 +86,13 @@ async def test_album_force_document_true_is_passed_through(client_and_root):
     client, root = client_and_root
 
     result = await media.send_file(
-        "Chat", ["one.png", "two.png"], caption="pair", topic_id=9, force_document=True
+        123, ["one.png", "two.png"], caption="pair", topic_id=9, force_document=True
     )
 
-    assert result == "Album sent to chat Chat with 2 files."
+    assert result == "Album sent to chat 123 with 2 files."
     assert client.calls == [
         {
-            "entity": "entity:Chat",
+            "entity": "entity:123",
             "file": [str(root / "one.png"), str(root / "two.png")],
             "caption": "pair",
             "reply_to": 9,
@@ -108,7 +108,7 @@ async def test_force_document_works_with_topic_and_schedule(client_and_root):
     when = datetime.now(timezone.utc) + timedelta(hours=1)
 
     result = await media.send_file(
-        "Chat",
+        123,
         "shot.png",
         topic_id=5,
         schedule_date=when.isoformat(),
@@ -127,7 +127,7 @@ async def test_album_force_document_works_with_schedule(client_and_root):
     when = datetime.now(timezone.utc) + timedelta(hours=1)
 
     result = await media.send_file(
-        "Chat", ["one.png", "two.png"], schedule_date=when.isoformat(), force_document=True
+        123, ["one.png", "two.png"], schedule_date=when.isoformat(), force_document=True
     )
 
     assert result.startswith("Album of 2 files scheduled for ")
@@ -139,7 +139,7 @@ async def test_album_force_document_works_with_schedule(client_and_root):
 async def test_force_document_does_not_bypass_path_validation(client_and_root):
     client, _ = client_and_root
 
-    result = await media.send_file("Chat", "../outside.png", force_document=True)
+    result = await media.send_file(123, "../outside.png", force_document=True)
 
     assert result == "Path traversal is not allowed."
     assert client.calls == []

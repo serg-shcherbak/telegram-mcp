@@ -123,7 +123,7 @@ class _AlbumClient:
             self.paths = file
 
 
-def _wire(monkeypatch, client, root, resolve_to="entity:chat"):
+def _wire(monkeypatch, client, root, resolve_to="entity:123"):
     monkeypatch.setattr(runtime, "SERVER_ALLOWED_ROOTS", [root])
     monkeypatch.setattr(media, "clients", {"default": client})
     monkeypatch.setattr(media, "get_client", lambda account=None: client)
@@ -148,7 +148,7 @@ async def test_send_file_passes_video_attributes(tmp_path, monkeypatch):
     client = _SingleClient()
     _wire(monkeypatch, client, root)
 
-    await media.send_file("chat", "clip.mp4")
+    await media.send_file(123, "clip.mp4")
 
     (attributes,) = client.kwargs["attributes"]
     assert (attributes.w, attributes.h, attributes.duration) == (1080, 1920, 42)
@@ -162,7 +162,7 @@ async def test_send_file_leaves_non_videos_alone(tmp_path, monkeypatch):
     client = _SingleClient()
     _wire(monkeypatch, client, root)
 
-    await media.send_file("chat", "doc.pdf")
+    await media.send_file(123, "doc.pdf")
 
     assert "attributes" not in client.kwargs
     assert "force_document" not in client.kwargs
@@ -176,7 +176,7 @@ async def test_send_file_forced_document_keeps_the_old_path(tmp_path, monkeypatc
     client = _SingleClient()
     _wire(monkeypatch, client, root)
 
-    await media.send_file("chat", "clip.mp4", force_document=True)
+    await media.send_file(123, "clip.mp4", force_document=True)
 
     assert "attributes" not in client.kwargs
     assert client.kwargs["force_document"] is True
@@ -192,7 +192,7 @@ async def test_album_with_video_builds_per_file_media(tmp_path, monkeypatch):
     client = _AlbumClient()
     _wire(monkeypatch, client, root)
 
-    await media.send_file("chat", ["clip.mp4", "pic.png"], caption="cap")
+    await media.send_file(123, ["clip.mp4", "pic.png"], caption="cap")
 
     video_media, photo_media = client.media_items
     assert isinstance(video_media, types.InputMediaUploadedDocument)
@@ -217,7 +217,7 @@ async def test_album_non_image_file_keeps_filename(tmp_path, monkeypatch):
     client = _AlbumClient()
     _wire(monkeypatch, client, root)
 
-    await media.send_file("chat", ["clip.mp4", "doc.pdf"])
+    await media.send_file(123, ["clip.mp4", "doc.pdf"])
 
     _video_media, doc_media = client.media_items
     assert isinstance(doc_media, types.InputMediaUploadedDocument)
@@ -235,7 +235,7 @@ async def test_image_only_album_keeps_telethon_path(tmp_path, monkeypatch):
     client = _AlbumClient()
     _wire(monkeypatch, client, root)
 
-    await media.send_album("chat", ["one.png", "two.png"])
+    await media.send_album(123, ["one.png", "two.png"])
 
     assert client.media_items is None
     assert client.paths == [str(first), str(second)]
@@ -252,7 +252,7 @@ async def test_video_album_forced_document_keeps_telethon_path(tmp_path, monkeyp
 
     # send_album has no force_document parameter; the list form of send_file
     # drives the same _send_album branch.
-    await media.send_file("chat", ["clip.mp4", "pic.png"], force_document=True)
+    await media.send_file(123, ["clip.mp4", "pic.png"], force_document=True)
 
     assert client.media_items is None
     assert len(client.paths) == 2

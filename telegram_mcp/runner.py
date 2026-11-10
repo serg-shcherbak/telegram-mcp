@@ -101,6 +101,16 @@ async def _verify_expected_username(label: str, client) -> None:
     )
 
 
+async def _verify_expected_owner(client) -> None:
+    expected = getattr(mcp, "_dot_owner_id", None)
+    if expected is None:
+        return
+    me = await client.get_me()
+    if type(getattr(me, "id", None)) is not int or me.id != expected or getattr(me, "bot", False):
+        await client.disconnect()
+        raise RuntimeError("Telegram session does not belong to the configured owner")
+
+
 class _NotAuthorized(RuntimeError):
     """The session connects but was never logged in."""
 
@@ -148,15 +158,16 @@ async def _connect_authorized_client(label, client) -> None:
             await asyncio.sleep(delay)
 
     if await client.is_user_authorized():
+        await _verify_expected_owner(client)
         await _verify_expected_username(label, client)
         return
 
     raise _NotAuthorized(
         f"Telegram client '{label}' is not authorized. Interactive phone login "
-        "is disabled for the MCP server because it runs over stdio. Generate a "
-        "session string with `uv run session_string_generator.py`, then set "
-        "TELEGRAM_SESSION_STRING or TELEGRAM_SESSION_STRING_<LABEL> in .env. "
-        "For existing file sessions, run the login outside the MCP server first."
+        "is disabled for the MCP server because it runs over stdio. Stop the server, "
+        "create a new private native session with `uv run session_string_generator.py`, "
+        "then set the printed TELEGRAM_SESSION_NAME[_<LABEL>] in your private environment. "
+        "Reuse an existing authorized own file session when available."
     )
 
 
@@ -184,19 +195,29 @@ async def _connect_or_skip(label, client) -> None:
 
 
 def _configure_transport_security() -> None:
-    """Wire MCP_ALLOWED_HOSTS/MCP_ALLOWED_ORIGINS into FastMCP's DNS-rebinding
-    protection, e.g. when the server sits behind a reverse proxy on a public
-    domain instead of only being reached via 127.0.0.1/localhost.
+    """Always enable FastMCP's Host/Origin validation for the HTTP transports.
+
+    Without it any web page open in the user's browser could POST tool calls
+    (send, delete, forward...) to the local server: cross-origin request
+    forgery, or DNS rebinding through a hostile domain. The protection is set
+    here explicitly rather than left to FastMCP's constructor, which only turns
+    it on for the host the instance was built with, not for MCP_HOST.
+
+    By default only 127.0.0.1/localhost/[::1] Host headers and browser origins
+    are accepted. MCP_ALLOWED_HOSTS/MCP_ALLOWED_ORIGINS replace those lists,
+    e.g. when the server sits behind a reverse proxy on a public domain.
     """
+    from mcp.server.transport_security import TransportSecuritySettings
+    from telegram_mcp.transport.http import _LOCAL_ALLOWED_HOSTS, _LOCAL_ALLOWED_ORIGINS
+
     raw_hosts = os.getenv("MCP_ALLOWED_HOSTS", "")
     allowed_hosts = [h.strip() for h in raw_hosts.split(",") if h.strip()]
-    if not allowed_hosts:
-        return
-
-    from mcp.server.transport_security import TransportSecuritySettings
-
     raw_origins = os.getenv("MCP_ALLOWED_ORIGINS", "")
     allowed_origins = [o.strip() for o in raw_origins.split(",") if o.strip()]
+    if not allowed_hosts:
+        allowed_hosts = list(_LOCAL_ALLOWED_HOSTS)
+        if not allowed_origins:
+            allowed_origins = list(_LOCAL_ALLOWED_ORIGINS)
 
     mcp.settings.transport_security = TransportSecuritySettings(
         enable_dns_rebinding_protection=True,
@@ -240,7 +261,8 @@ async def _main() -> None:
         # Runs in background: blocking startup on this (e.g. under a
         # GetDialogsRequest flood wait) makes MCP clients time out, and
         # resolve_entity() re-warms the cache on miss anyway.
-        print("Warming entity caches (background)...", file=sys.stderr)
+        if getattr(mcp, "_dot_access_config", None) is None:
+            print("Warming entity caches (background)...", file=sys.stderr)
 
         async def _warm_caches() -> None:
             async def _warm_client(label: str, cl: TelegramClient) -> None:
@@ -261,7 +283,8 @@ async def _main() -> None:
             except Exception as warm_exc:
                 print(f"Entity cache warm failed: {warm_exc}", file=sys.stderr)
 
-        asyncio.create_task(_warm_caches())
+        if getattr(mcp, "_dot_access_config", None) is None:
+            asyncio.create_task(_warm_caches())
 
         transport = os.getenv("MCP_TRANSPORT", "stdio").lower()
 

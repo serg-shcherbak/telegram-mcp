@@ -35,6 +35,11 @@ def _message(text="🍷 News", entities=None, **kwargs):
     )
 
 
+def _context_messages(*source_messages):
+    by_id = {msg.id: msg for msg in source_messages}
+    return lambda entity, **kwargs: by_id.get(kwargs["ids"]) if "ids" in kwargs else []
+
+
 @pytest.mark.parametrize("msg", [SimpleNamespace(), _message(entities=[]), _message(text="")])
 def test_messages_without_custom_emoji_have_no_metadata(msg):
     assert messages.get_custom_emoji_metadata(msg) == {}
@@ -193,7 +198,7 @@ async def test_json_readers_expose_optional_metadata(client, tool, arguments, cu
     if tool is messages.search_global:
         client.return_value = SimpleNamespace(messages=[msg], users=[types.User(id=42)], chats=[])
     if tool is messages.get_message_context:
-        client.get_messages.side_effect = [[], msg, []]
+        client.get_messages.side_effect = _context_messages(msg)
     result = json.loads(await tool(**arguments, account="test"))
     record = result["results"][0]
     assert record["text"] == "🍷 News"
@@ -219,7 +224,9 @@ async def test_json_readers_expose_optional_metadata(client, tool, arguments, cu
 @pytest.mark.asyncio
 async def test_context_includes_replied_message_metadata(client):
     reply = _message("Reply", [], reply_to=types.MessageReplyHeader(reply_to_msg_id=2))
-    client.get_messages.side_effect = [[], reply, [], _message()]
+    replied = _message()
+    replied.id = 2
+    client.get_messages.side_effect = _context_messages(reply, replied)
     result = json.loads(await messages.get_message_context(42, 1, account="test"))
     assert "custom_emojis" not in result["results"][0]
     assert result["results"][0]["replied_message"]["custom_emojis"] == [EMOJI]
@@ -230,7 +237,8 @@ async def test_context_includes_hidden_link_urls(client):
     link = types.MessageEntityTextUrl(0, 5, "https://t.me/c/1565619651/424991")
     reply = _message("Bayan", [link], reply_to=types.MessageReplyHeader(reply_to_msg_id=2))
     replied = _message("Media", [link])
-    client.get_messages.side_effect = [[], reply, [], replied]
+    replied.id = 2
+    client.get_messages.side_effect = _context_messages(reply, replied)
 
     result = json.loads(await messages.get_message_context(42, 1, account="test"))
 

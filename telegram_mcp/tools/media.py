@@ -6,6 +6,7 @@ import os
 import shutil
 import struct
 import tempfile
+from contextlib import asynccontextmanager
 from uuid import uuid4
 
 from pypdf import PdfReader
@@ -37,6 +38,63 @@ def _known_media_size(message) -> Optional[int]:
         return size
     size = getattr(message, "size", None)  # a bare Document resolved from rich_message
     return size if isinstance(size, int) and size >= 0 else None
+
+
+class _MediaDownloadError(Exception):
+    pass
+
+
+def _select_download_target(msg, message_id, media_id=None):
+    if not msg:
+        raise _MediaDownloadError("No media found in the specified message.")
+    if msg.media:
+        if media_id is not None:
+            raise _MediaDownloadError(
+                f"media_id picks among a rich post's embedded media; message {message_id} "
+                "carries regular media — download it without media_id."
+            )
+        return msg
+    pool = [item for item in rich_message_media(msg) if item["media"] is not None]
+    if media_id is not None:
+        pool = [item for item in pool if item["id"] == media_id]
+        if not pool:
+            raise _MediaDownloadError(f"No rich media with id {media_id} in message {message_id}.")
+    if not pool:
+        raise _MediaDownloadError("No media found in the specified message.")
+    return pool[0]["media"]
+
+
+@asynccontextmanager
+async def _staged_media_download(cl, target, parent, filename, limit, tool_name, message_id):
+    too_large = f"Media is too large for {tool_name} (limit: {limit} bytes)."
+    declared_size = _known_media_size(target)
+    if declared_size is not None and declared_size > limit:
+        raise _MediaDownloadError(too_large)
+    temp_dir = Path(tempfile.mkdtemp(prefix=".telegram-mcp-download-", dir=str(parent)))
+    try:
+
+        def enforce_download_limit(received: int, total: int) -> None:
+            if received > limit or (total and total > limit):
+                raise _DownloadLimitExceeded
+
+        try:
+            downloaded = await cl.download_media(
+                target,
+                file=str(temp_dir / filename),
+                progress_callback=enforce_download_limit,
+            )
+        except _DownloadLimitExceeded:
+            raise _MediaDownloadError(too_large) from None
+        if not downloaded:
+            raise _MediaDownloadError(f"Download failed for message {message_id}.")
+        final = Path(downloaded).resolve(strict=True)
+        if final.parent != temp_dir.resolve() or not final.is_file():
+            raise _MediaDownloadError("Download failed: resulting temporary path is invalid.")
+        if final.stat().st_size > limit:
+            raise _MediaDownloadError(too_large)
+        yield final
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 def _force_document_kwargs(force_document: bool) -> Dict[str, bool]:
@@ -520,27 +578,7 @@ async def download_media(
         cl = get_client(account)
         entity = await resolve_entity(chat_id, cl)
         msg = await cl.get_messages(entity, ids=message_id)
-        if not msg:
-            return "No media found in the specified message."
-
-        # Block-format posts keep their embedded photos/videos as ids resolved
-        # from rich_message.photos/documents — nothing sits in msg.media.
-        target = msg
-        if not msg.media:
-            pool = [m for m in rich_message_media(msg) if m["media"] is not None]
-            if media_id is not None:
-                pool = [m for m in pool if m["id"] == media_id]
-                if not pool:
-                    return f"No rich media with id {media_id} in message {message_id}."
-            if not pool:
-                return "No media found in the specified message."
-            target = pool[0]["media"]
-        elif media_id is not None:
-            return (
-                f"media_id picks among a rich post's embedded media; message {message_id} "
-                "carries regular media — download it without media_id."
-            )
-
+        target = _select_download_target(msg, message_id, media_id)
         limit = MAX_FILE_BYTES["download_media"]
         declared_size = _known_media_size(target)
         if declared_size is not None and declared_size > limit:
@@ -556,35 +594,10 @@ async def download_media(
         if path_error:
             return path_error
 
-        temp_dir = Path(
-            tempfile.mkdtemp(prefix=".telegram-mcp-download-", dir=str(out_path.parent))
-        )
-        try:
-            staged_name = out_path.with_suffix("").name if out_path.suffix else out_path.name
-            temp_requested_path = temp_dir / staged_name
-
-            def enforce_download_limit(received: int, total: int) -> None:
-                if received > limit or (total and total > limit):
-                    raise _DownloadLimitExceeded
-
-            try:
-                downloaded = await cl.download_media(
-                    target,
-                    file=str(temp_requested_path),
-                    progress_callback=enforce_download_limit,
-                )
-            except _DownloadLimitExceeded:
-                return f"Media is too large for download_media (limit: {limit} bytes)."
-
-            if not downloaded:
-                return f"Download failed for message {message_id}."
-
-            temp_final_path = Path(downloaded).resolve(strict=True)
-            if temp_final_path.parent != temp_dir.resolve():
-                return "Download failed: resulting temporary path is invalid."
-            if temp_final_path.stat().st_size > limit:
-                return f"Media is too large for download_media (limit: {limit} bytes)."
-
+        staged_name = out_path.with_suffix("").name if out_path.suffix else out_path.name
+        async with _staged_media_download(
+            cl, target, out_path.parent, staged_name, limit, "download_media", message_id
+        ) as temp_final_path:
             final_path = out_path
             if temp_final_path.suffix:
                 final_path, path_error = await _resolve_writable_file_path(
@@ -598,8 +611,8 @@ async def download_media(
 
             os.replace(temp_final_path, final_path)
             return f"Media downloaded to {final_path}."
-        finally:
-            shutil.rmtree(temp_dir, ignore_errors=True)
+    except _MediaDownloadError as error:
+        return log_and_format_error("download_media", error, user_message=str(error))
     except Exception as e:
         return log_and_format_error(
             "download_media",
