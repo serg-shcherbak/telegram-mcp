@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import logging
 from typing import Any
+from urllib.parse import urlsplit
 
+from mcp.server.transport_security import TransportSecurityMiddleware, TransportSecuritySettings
+from starlette.requests import HTTPConnection
 from starlette.responses import JSONResponse, Response
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
@@ -18,6 +21,31 @@ from telegram_mcp.transport.protocol import (
 
 logger = logging.getLogger(__name__)
 
+_LOCAL_ALLOWED_HOSTS = ("127.0.0.1:*", "localhost:*", "[::1]:*")
+_LOCAL_ALLOWED_ORIGINS = ("http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*")
+
+
+def _valid_authority(value: str, *, origin: bool = False) -> bool:
+    # The SDK's wildcard-port matcher also accepts a non-numeric port suffix.
+    if any(char.isspace() for char in value):
+        return False
+    if origin and value == "null":
+        return True
+    try:
+        parsed = urlsplit(value if origin else f"//{value}")
+        return bool(
+            parsed.hostname
+            and not parsed.username
+            and not parsed.password
+            and not parsed.path
+            and not parsed.query
+            and not parsed.fragment
+            and (not origin or parsed.scheme in ("http", "https"))
+            and (parsed.port is None or 0 < parsed.port <= 65535)
+        )
+    except ValueError:
+        return False
+
 
 class ProtocolNegotiationMiddleware:
     """ASGI middleware that enforces MCP protocol negotiation and response headers.
@@ -30,14 +58,46 @@ class ProtocolNegotiationMiddleware:
     - Provides a JSON discovery response for plain GET probes (non-SSE) on the MCP endpoint.
     """
 
-    def __init__(self, app: ASGIApp):
+    def __init__(self, app: ASGIApp, mcp_instance: Any = None):
         self.app = app
+        self.mcp_instance = mcp_instance
+        settings = getattr(mcp_instance, "settings", None)
+        self.mcp_path = getattr(settings, "streamable_http_path", "/mcp").rstrip("/") or "/"
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
 
+        request = HTTPConnection(scope)
+        settings = getattr(
+            getattr(self.mcp_instance, "settings", None), "transport_security", None
+        )
+        if settings is None:
+            settings = TransportSecuritySettings(
+                allowed_hosts=list(_LOCAL_ALLOWED_HOSTS),
+                allowed_origins=list(_LOCAL_ALLOWED_ORIGINS),
+            )
+        if settings.enable_dns_rebinding_protection:
+            for name, status_code in (("host", 421), ("origin", 403)):
+                value = request.headers.get(name)
+                if value and not _valid_authority(value, origin=name == "origin"):
+                    response = Response(f"Invalid {name.title()} header", status_code=status_code)
+                    await response(scope, receive, send)
+                    return
+        rejection = await TransportSecurityMiddleware(settings).validate_request(request)
+        if rejection is not None:
+            await rejection(scope, receive, send)
+            return
+
+        if (scope.get("path", "").rstrip("/") or "/") != self.mcp_path:
+            await self.app(scope, receive, send)
+            return
+
+        origin = request.headers.get("origin")
+        origin_headers = (
+            {"Access-Control-Allow-Origin": origin, "Vary": "Origin"} if origin else {}
+        )
         headers = dict(scope.get("headers", []))
         raw_version_bytes = headers.get(MCP_PROTOCOL_VERSION_HEADER.encode("latin-1"))
         requested_version = (
@@ -54,7 +114,7 @@ class ProtocolNegotiationMiddleware:
                 headers={
                     "Allow": "GET, POST, DELETE, OPTIONS, HEAD",
                     MCP_PROTOCOL_VERSION_HEADER: requested_version or LATEST_PROTOCOL_VERSION,
-                    "Access-Control-Allow-Origin": "*",
+                    **origin_headers,
                     "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS, HEAD",
                     "Access-Control-Allow-Headers": cors_headers,
                     "Access-Control-Expose-Headers": "MCP-Protocol-Version, MCP-Session-Id",
@@ -106,7 +166,7 @@ class ProtocolNegotiationMiddleware:
                 content=discovery_data,
                 headers={
                     MCP_PROTOCOL_VERSION_HEADER: negotiated_version,
-                    "Access-Control-Allow-Origin": "*",
+                    **origin_headers,
                     "Access-Control-Expose-Headers": "MCP-Protocol-Version, MCP-Session-Id",
                 },
             )
@@ -149,7 +209,7 @@ def patch_fastmcp_streamable_http() -> None:
 
         def wrapped_streamable_http_app(self: Any, *args: Any, **kwargs: Any) -> Any:
             app = original_streamable_http_app(self, *args, **kwargs)
-            return ProtocolNegotiationMiddleware(app)
+            return ProtocolNegotiationMiddleware(app, self)
 
         FastMCP.streamable_http_app = wrapped_streamable_http_app  # type: ignore[assignment]
         FastMCP._protocol_negotiation_patched = True  # type: ignore[attr-defined]
@@ -171,7 +231,7 @@ def create_streamable_http_app(mcp_instance: Any) -> Any:
     app = mcp_instance.streamable_http_app()
     # If not already wrapped via monkeypatch
     if not isinstance(app, ProtocolNegotiationMiddleware):
-        app = ProtocolNegotiationMiddleware(app)
+        app = ProtocolNegotiationMiddleware(app, mcp_instance)
     return app
 
 

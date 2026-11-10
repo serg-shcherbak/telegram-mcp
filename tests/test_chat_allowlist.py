@@ -1,5 +1,6 @@
 """Unit tests for TELEGRAM_ALLOWED_CHAT_IDS per-chat privacy allowlist (Issue #212)."""
 
+import asyncio
 import json
 from types import SimpleNamespace
 from typing import Optional, Union
@@ -91,17 +92,22 @@ def test_parse_allowed_chat_ids_none_and_empty():
     assert _parse_allowed_chat_ids(" , ,  ") is None
 
 
-def test_parse_allowed_chat_ids_integers_and_marked_variants():
-    # User ID: 12345678 -> also indexes supergroup (-1000000012345678) and group (-12345678)
-    parsed = _parse_allowed_chat_ids("12345678, -100123456789")
-    assert parsed is not None
-    assert 12345678 in parsed
-    assert -100123456789 in parsed
-    # Unmarked variant of supergroup is 123456789
-    assert 123456789 in parsed
-    # Variants of 12345678
-    assert (-1000000000000 - 12345678) in parsed
-    assert -12345678 in parsed
+def test_parse_allowed_chat_ids_keeps_marked_ids_exact():
+    """Each numeric entry is kept as written, never widened to another peer type."""
+    parsed = _parse_allowed_chat_ids("12345678, -100123456789, -4567")
+    assert parsed == {12345678, -100123456789, -4567}
+    # Users, basic groups and channels have separate ID namespaces: allowing one
+    # must not allow the unrelated chat that shares its bare number (#378).
+    assert 123456789 not in parsed  # user sharing the channel's bare id
+    assert 4567 not in parsed  # user sharing the basic group's bare id
+    assert -12345678 not in parsed  # basic group sharing the user's id
+    assert (-1000000000000 - 12345678) not in parsed  # channel sharing the user's id
+
+
+def test_parse_allowed_chat_ids_phone_like_token_is_not_an_id():
+    parsed = _parse_allowed_chat_ids("+79991234567")
+    assert parsed == {"+79991234567"}
+    assert 79991234567 not in parsed
 
 
 def test_parse_allowed_chat_ids_usernames_and_handles():
@@ -155,7 +161,7 @@ def test_is_chat_allowed_when_enabled(monkeypatch):
     assert is_chat_allowed(12345678) is True
     assert is_chat_allowed("12345678") is True
     assert is_chat_allowed(-100123456789) is True
-    assert is_chat_allowed(123456789) is True  # Unmarked variant
+    assert is_chat_allowed("-100123456789") is True
     assert is_chat_allowed("@allowed_handle") is True
     assert is_chat_allowed("allowed_handle") is True
     assert check_chat_access(12345678) is None
@@ -164,6 +170,13 @@ def test_is_chat_allowed_when_enabled(monkeypatch):
     assert is_chat_allowed(99999999) is False
     assert is_chat_allowed(-100999999999) is False
     assert is_chat_allowed("secret_group") is False
+    # Same bare numbers in another namespace are different chats (#378).
+    assert is_chat_allowed(123456789) is False  # user, not channel -100123456789
+    assert is_chat_allowed("123456789") is False
+    assert is_chat_allowed(-12345678) is False  # basic group, not user 12345678
+    assert is_chat_allowed(-1000012345678) is False  # channel, not user 12345678
+    assert is_chat_allowed("+12345678") is False  # phone number, not user 12345678
+    assert is_chat_allowed(True) is False
     err = check_chat_access(99999999)
     assert err is not None
     assert "restricted by privacy policy" in err
@@ -182,6 +195,270 @@ def test_is_chat_allowed_with_telethon_entities(monkeypatch):
 
     forbidden_channel = SimpleNamespace(id=9999, title="Secret Channel", username="secret_ch")
     assert is_chat_allowed(999999, forbidden_channel) is False
+
+
+def _typed_channel(channel_id: int, title: str = "Channel", username=None) -> Channel:
+    from datetime import datetime, timezone
+
+    from telethon.tl.types import ChatPhotoEmpty
+
+    return Channel(
+        id=channel_id,
+        title=title,
+        photo=ChatPhotoEmpty(),
+        date=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        username=username,
+        access_hash=1,
+    )
+
+
+def _typed_basic_group(chat_id: int, title: str = "Group") -> Chat:
+    from datetime import datetime, timezone
+
+    from telethon.tl.types import ChatPhotoEmpty
+
+    return Chat(
+        id=chat_id,
+        title=title,
+        photo=ChatPhotoEmpty(),
+        participants_count=2,
+        date=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        version=1,
+    )
+
+
+def test_allowed_channel_does_not_allow_user_with_same_bare_id(monkeypatch):
+    """CWE-863 (#378): allowing channel -100N must not open the private chat with user N."""
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", "-1001234567890")
+
+    assert is_chat_allowed(None, _typed_channel(1234567890)) is True
+    colliding_user = User(id=1234567890, first_name="Stranger")
+    assert is_chat_allowed(None, colliding_user) is False
+    assert is_chat_allowed(1234567890, colliding_user) is False
+    assert is_chat_allowed("1234567890", colliding_user) is False
+
+
+def test_allowed_user_does_not_allow_chats_with_same_bare_id(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", "4242")
+
+    assert is_chat_allowed(None, User(id=4242, first_name="Friend")) is True
+    assert is_chat_allowed(None, _typed_channel(4242)) is False
+    assert is_chat_allowed(None, _typed_basic_group(4242)) is False
+    assert is_chat_allowed(-1000000004242, _typed_channel(4242)) is False
+    assert is_chat_allowed(-4242, _typed_basic_group(4242)) is False
+
+
+def test_allowed_basic_group_does_not_allow_user_with_same_bare_id(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", "-777")
+
+    assert is_chat_allowed(None, _typed_basic_group(777)) is True
+    assert is_chat_allowed(None, User(id=777, first_name="Stranger")) is False
+    assert is_chat_allowed(777) is False
+
+
+def test_forbidden_chat_types_are_matched_by_marked_id(monkeypatch):
+    """ChannelForbidden/ChatForbidden must not fall back to the bare (user-namespace) id."""
+    from telethon.tl.types import ChannelForbidden, ChatForbidden
+
+    channel = ChannelForbidden(id=555, access_hash=1, title="Gone")
+    group = ChatForbidden(id=556, title="Gone")
+    assert get_marked_id(channel) == -1000000000555
+    assert get_marked_id(group) == -556
+
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", "555, 556")
+    assert is_chat_allowed(None, channel) is False
+    assert is_chat_allowed(None, group) is False
+
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", "-1000000000555, -556")
+    assert is_chat_allowed(None, channel) is True
+    assert is_chat_allowed(None, group) is True
+
+
+@pytest.mark.parametrize(
+    "peer, expected",
+    [
+        (types.InputPeerUser(77, 1), 77),
+        (types.InputPeerChat(77), -77),
+        (types.InputPeerChannel(77, 1), -1000000000077),
+        (types.PeerUser(77), 77),
+        (types.PeerChat(77), -77),
+        (types.PeerChannel(77), -1000000000077),
+    ],
+)
+def test_input_peers_keep_their_namespace(monkeypatch, peer, expected):
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", str(expected))
+    assert get_marked_id(peer) == expected
+    assert is_chat_allowed(None, peer)
+
+
+def test_resolved_entity_overrides_allowed_input_spelling(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", "77,@allowed")
+    forbidden = _typed_channel(77)
+    assert not is_chat_allowed(77, forbidden)
+    assert not is_chat_allowed("@allowed", forbidden)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("getter", ["resolve_entity", "resolve_input_entity"])
+async def test_resolver_rejects_a_different_peer_namespace(monkeypatch, getter):
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", "77")
+
+    class Client:
+        async def get_entity(self, identifier):
+            return _typed_channel(77)
+
+        async def get_input_entity(self, identifier):
+            return types.InputPeerChannel(77, 1)
+
+    monkeypatch.setattr(runtime, "ensure_connected", _connected)
+    with pytest.raises(ChatAccessDeniedError):
+        await getattr(runtime, getter)(77, Client())
+
+
+@pytest.mark.asyncio
+async def test_scoped_resolution_does_not_scan_dialogs_or_guess_peer_types(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", "77")
+
+    class Client:
+        def __init__(self):
+            self.lookups = []
+            self.dialog_scans = 0
+
+        async def get_entity(self, identifier):
+            self.lookups.append(identifier)
+            raise ValueError("not cached")
+
+        async def get_dialogs(self):
+            self.dialog_scans += 1
+            return []
+
+    client = Client()
+    monkeypatch.setattr(runtime, "ensure_connected", _connected)
+    with pytest.raises(ValueError):
+        await runtime.resolve_entity(77, client)
+    assert client.dialog_scans == 0
+    assert set(client.lookups) == {77}
+
+
+@pytest.mark.asyncio
+async def test_chat_validation_covers_positional_arguments(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", "77")
+
+    @validate_id("chat_id")
+    async def read(chat_id):
+        return "private text"
+
+    assert "restricted by privacy policy" in await read(88)
+    assert await read("77") == "private text"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", [True, False])
+async def test_chat_validation_rejects_boolean_ids_without_an_allowlist(value):
+    @validate_id("chat_id")
+    async def read(chat_id):
+        return "private text"
+
+    assert "Invalid chat_id" in await read(chat_id=value)
+
+
+@pytest.mark.asyncio
+async def test_phone_number_is_resolved_before_canonical_scope_check(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", "77")
+    seen = []
+
+    class Client:
+        async def get_entity(self, identifier):
+            seen.append(identifier)
+            return User(id=88 if identifier == "+77" else 77, first_name="Recipient")
+
+    client = Client()
+    monkeypatch.setattr(runtime, "ensure_connected", _connected)
+    monkeypatch.setattr(runtime, "get_client", lambda account=None: client)
+
+    @validate_id("chat_id")
+    async def read(chat_id):
+        await runtime.resolve_entity(chat_id, client)
+        return "private text"
+
+    result = await read(chat_id="+77")
+    assert "restricted by privacy policy" in result
+    assert seen == ["+77"]
+
+
+@pytest.mark.asyncio
+async def test_self_input_peer_uses_the_authenticated_account_id(monkeypatch):
+    class Client:
+        async def get_input_entity(self, identifier):
+            return types.InputPeerSelf()
+
+        async def get_me(self):
+            return User(id=77, first_name="Owner")
+
+    monkeypatch.setattr(runtime, "ensure_connected", _connected)
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", "77")
+    assert isinstance(await runtime.resolve_input_entity("me", Client()), types.InputPeerSelf)
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", "88")
+    with pytest.raises(ChatAccessDeniedError):
+        await runtime.resolve_input_entity("me", Client())
+
+
+@pytest.mark.asyncio
+async def test_member_resolution_stays_within_the_checked_group_operation(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", "-77")
+
+    class Client:
+        async def get_entity(self, identifier):
+            if identifier == -77:
+                return _typed_basic_group(77)
+            return User(id=88, first_name="Member")
+
+    monkeypatch.setattr(runtime, "ensure_connected", _connected)
+
+    @validate_id("group_id", "user_id")
+    async def group_member(group_id, user_id):
+        client = Client()
+        group = await runtime.resolve_entity(group_id, client)
+        member = await runtime.resolve_entity(user_id, client)
+        return group.id, member.id
+
+    assert await group_member(group_id=-77, user_id=88) == (77, 88)
+    with pytest.raises(ChatAccessDeniedError):
+        await runtime.resolve_entity(88, Client())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [RuntimeError, asyncio.CancelledError])
+async def test_source_scope_resets_after_error_or_cancellation(monkeypatch, failure):
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", "-77")
+
+    class Client:
+        async def get_entity(self, identifier):
+            return User(id=88, first_name="Other")
+
+    monkeypatch.setattr(runtime, "ensure_connected", _connected)
+
+    @validate_id("group_id")
+    async def action(group_id):
+        raise failure()
+
+    with pytest.raises(failure):
+        await action(group_id=-77)
+    with pytest.raises(ChatAccessDeniedError):
+        await runtime.resolve_entity(88, Client())
+
+
+@pytest.mark.asyncio
+async def test_validate_id_blocks_user_colliding_with_allowed_typed_channel(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", "-1001234567890")
+
+    @validate_id("chat_id")
+    async def send(chat_id: Union[int, str], account: Optional[str] = None):
+        return f"sent:{chat_id}"
+
+    assert await send(chat_id=-1001234567890) == "sent:-1001234567890"
+    blocked = await send(chat_id=1234567890)
+    assert "restricted by privacy policy" in blocked
 
 
 # ==============================================================================
@@ -234,8 +511,8 @@ async def test_validate_id_blocks_batch_from_and_to_chats(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_list_chats_filters_out_unallowed_chats(monkeypatch):
-    allowed_entity = SimpleNamespace(id=111, title="Public Dev", username="dev_chat")
-    secret_entity = SimpleNamespace(id=222, title="Private CEO", username="ceo_chat")
+    allowed_entity = _typed_channel(111, title="Public Dev", username="dev_chat")
+    secret_entity = _typed_channel(222, title="Private CEO", username="ceo_chat")
 
     d1 = FakeDialog(allowed_entity, unread_count=2)
     d2 = FakeDialog(secret_entity, unread_count=5)
@@ -246,21 +523,18 @@ async def test_list_chats_filters_out_unallowed_chats(monkeypatch):
 
     monkeypatch.setattr(chats, "get_client", lambda account=None: client)
     monkeypatch.setattr(chats, "ensure_connected", _fake_connected)
-    monkeypatch.setattr(chats, "get_marked_id", lambda e: -100111 if e.id == 111 else -100222)
     monkeypatch.setattr(chats, "get_entity_type", lambda e: "Channel")
     monkeypatch.setattr(chats, "get_entity_filter_type", lambda e: "channel")
 
-    # When allowlist is set to only allowed_entity (-100111)
-    monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", "-100111")
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", "-1000000000111")
 
     result = await chats.list_chats(account=None)
     parsed = json.loads(result).get("results", [])
 
     assert len(parsed) == 1
-    assert parsed[0]["chat_id"] == -100111
+    assert parsed[0]["chat_id"] == -1000000000111
     assert parsed[0]["title"] == "Public Dev"
-    # Secret chat (-100222) must never be present
-    assert not any(c.get("chat_id") == -100222 for c in parsed)
+    assert not any(c.get("chat_id") == -1000000000222 for c in parsed)
 
 
 @pytest.mark.asyncio

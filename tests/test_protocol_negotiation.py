@@ -188,7 +188,115 @@ def test_http_transport_options_preflight():
         assert response.status_code == 204
         assert response.headers.get("mcp-protocol-version") == "2026-07-28"
         assert "OPTIONS" in response.headers.get("allow", "")
-        assert response.headers.get("access-control-allow-origin") == "*"
+        # Never a wildcard: no Origin, no CORS grant (#378).
+        assert "access-control-allow-origin" not in response.headers
+
+
+_TOOLS_LIST = {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
+_POST_HEADERS = {
+    "MCP-Protocol-Version": "2026-07-28",
+    "Content-Type": "application/json",
+    "Accept": "application/json, text/event-stream",
+}
+
+
+@pytest.mark.parametrize(
+    "method,path",
+    [
+        ("OPTIONS", "/mcp"),
+        ("GET", "/mcp"),
+        ("POST", "/mcp"),
+        ("PUT", "/upload/x?exp=1&sig=x"),
+        ("GET", "/media/x?exp=1&sig=x"),
+    ],
+)
+def test_http_transport_rejects_cross_origin_requests(method, path):
+    """CWE-942 (#378): a web page on another origin must not reach the server at all."""
+    app = create_streamable_http_app(mcp)
+    with TestClient(app, base_url="http://localhost:8765") as client:
+        headers = dict(_POST_HEADERS, Origin="https://evil.example")
+        kwargs = {"json": _TOOLS_LIST} if method == "POST" else {}
+        response = client.request(method, path, headers=headers, **kwargs)
+        assert response.status_code == 403
+        assert "access-control-allow-origin" not in response.headers
+
+
+@pytest.mark.parametrize(
+    "origin",
+    ["null", "http://localhost.evil.example", "http://localhost:80.evil", "http://localhost:\t80"],
+)
+def test_http_transport_rejects_lookalike_origins(origin):
+    app = create_streamable_http_app(mcp)
+    with TestClient(app, base_url="http://localhost:8765") as client:
+        response = client.options("/mcp", headers={"Origin": origin})
+        assert response.status_code == 403
+
+
+def test_http_transport_preflight_echoes_only_allowed_origin():
+    app = create_streamable_http_app(mcp)
+    with TestClient(app, base_url="http://localhost:8765") as client:
+        response = client.options("/mcp", headers={"Origin": "http://localhost:6274"})
+        assert response.status_code == 204
+        assert response.headers.get("access-control-allow-origin") == "http://localhost:6274"
+        assert "origin" in response.headers.get("vary", "").lower()
+
+
+def test_http_transport_allows_requests_without_origin():
+    """Non-browser MCP clients send no Origin header and keep working."""
+    app = create_streamable_http_app(mcp)
+    with TestClient(app, base_url="http://localhost:8765") as client:
+        response = client.post("/mcp", headers=_POST_HEADERS, json=_TOOLS_LIST)
+        assert response.status_code == 200
+
+
+@pytest.mark.parametrize("allowed_origin", ["https://app.example.com", "null"])
+def test_http_transport_honours_configured_allowed_origins(monkeypatch, allowed_origin):
+    from mcp.server.transport_security import TransportSecuritySettings
+
+    monkeypatch.setattr(
+        mcp.settings,
+        "transport_security",
+        TransportSecuritySettings(
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=["mcp.example.com"],
+            allowed_origins=[allowed_origin],
+        ),
+    )
+    app = create_streamable_http_app(mcp)
+    with TestClient(app, base_url="http://mcp.example.com") as client:
+        ok = client.options("/mcp", headers={"Origin": allowed_origin})
+        assert ok.status_code == 204
+        assert ok.headers.get("access-control-allow-origin") == allowed_origin
+        # Local origins are no longer implied once the operator names their own.
+        denied = client.options("/mcp", headers={"Origin": "http://localhost:3000"})
+        assert denied.status_code == 403
+
+
+@pytest.mark.parametrize("method", ["GET", "OPTIONS", "POST"])
+def test_http_transport_rejects_invalid_host_before_early_responses(method):
+    app = create_streamable_http_app(mcp)
+    with TestClient(app, base_url="http://attacker.example") as client:
+        kwargs = {"json": _TOOLS_LIST} if method == "POST" else {}
+        response = client.request(method, "/mcp", headers=_POST_HEADERS, **kwargs)
+        assert response.status_code == 421
+
+
+@pytest.mark.parametrize("method", ["GET", "OPTIONS"])
+def test_http_discovery_does_not_replace_unrelated_routes(method):
+    app = create_streamable_http_app(mcp)
+    with TestClient(app, base_url="http://localhost:8765") as client:
+        assert client.request(method, "/not-mcp").status_code == 404
+
+
+def test_http_discovery_uses_the_configured_mcp_path():
+    from mcp.server.fastmcp import FastMCP
+
+    custom = FastMCP("custom", streamable_http_path="/private-mcp", stateless_http=True)
+    app = create_streamable_http_app(custom)
+    with TestClient(app, base_url="http://localhost:8765") as client:
+        assert client.get("/private-mcp").status_code == 200
+        assert client.options("/private-mcp").status_code == 204
+        assert client.get("/mcp").status_code == 404
 
 
 def test_http_transport_discovery_get_probe():
