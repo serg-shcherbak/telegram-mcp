@@ -1,5 +1,7 @@
 """Messages MCP tools."""
 
+from telegram_mcp.event_bridge.reconciliation import observe_send
+
 import base64
 import math
 
@@ -642,6 +644,7 @@ async def _send_rich(cl, entity, text: str, parse_mode: str, reply_to: Optional[
         if is_premium_rpc_error(e):
             return premium_required_result("send_message")
         raise
+    await observe_send(cl, entity, result, reply_to=reply_to)
     return json.dumps(
         {"sent": True, "rich": True, "message_id": _first_sent_message_id(result)},
         ensure_ascii=False,
@@ -1001,8 +1004,10 @@ async def send_message(
                     entities=entities,
                 )
             )
+            await observe_send(cl, entity, result, reply_to=reply_to)
             return _sent_result(_first_sent_message_id(result))
         sent = await cl.send_message(entity, message, parse_mode=parse_mode, reply_to=reply_to)
+        await observe_send(cl, entity, sent, reply_to=reply_to)
         return _sent_result(sent)
     except Exception as e:
         return log_and_format_error("send_message", e, chat_id=chat_id)
@@ -2531,7 +2536,7 @@ async def reply_to_message(
                 return error
             import random
 
-            await cl(
+            result = await cl(
                 functions.messages.SendMessageRequest(
                     peer=entity,
                     message=text,
@@ -2540,8 +2545,10 @@ async def reply_to_message(
                     entities=entities,
                 )
             )
+            await observe_send(cl, entity, result, reply_to=message_id)
             return f"Replied to message {message_id} in chat {chat_id}."
-        await cl.send_message(entity, text, reply_to=message_id, parse_mode=parse_mode)
+        sent = await cl.send_message(entity, text, reply_to=message_id, parse_mode=parse_mode)
+        await observe_send(cl, entity, sent, reply_to=message_id)
         return f"Replied to message {message_id} in chat {chat_id}."
     except Exception as e:
         return log_and_format_error(

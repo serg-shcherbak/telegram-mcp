@@ -221,6 +221,8 @@ def _maybe_autostart_feed() -> None:
 
 async def _on_new_incoming(event) -> None:
     """Record incoming private (non-bot, non-self) messages for the debounce tools."""
+    if not _parse_bool_env(os.getenv("TELEGRAM_LEGACY_EVENTS"), True):
+        return
     try:
         if not event.is_private:
             return
@@ -376,6 +378,8 @@ def _iso_utc(value) -> Optional[str]:
 
 async def _on_message_event(event, account: Optional[str] = None) -> None:
     """Record one event per new message of a private chat or group."""
+    if not _parse_bool_env(os.getenv("TELEGRAM_LEGACY_EVENTS"), True):
+        return
     try:
         if _EVENT_LOG_SIZE == 0:
             return
@@ -667,6 +671,8 @@ def register_incoming_handlers() -> None:
     handler also sees outgoing ones (sent from the owner's other devices:
     Telethon does not dispatch messages this client sent itself).
     """
+    if not _parse_bool_env(os.getenv("TELEGRAM_LEGACY_EVENTS"), True):
+        return
     for label, cl in clients.items():
         try:
             cl.add_event_handler(_on_new_incoming, _events.NewMessage(incoming=True))

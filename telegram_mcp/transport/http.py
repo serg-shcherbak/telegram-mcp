@@ -30,8 +30,9 @@ class ProtocolNegotiationMiddleware:
     - Provides a JSON discovery response for plain GET probes (non-SSE) on the MCP endpoint.
     """
 
-    def __init__(self, app: ASGIApp):
+    def __init__(self, app: ASGIApp, mcp_path: str = "/mcp"):
         self.app = app
+        self.mcp_path = mcp_path.rstrip("/") or "/"
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
@@ -39,13 +40,14 @@ class ProtocolNegotiationMiddleware:
             return
 
         headers = dict(scope.get("headers", []))
+        is_mcp_path = (scope.get("path", "").rstrip("/") or "/") == self.mcp_path
         raw_version_bytes = headers.get(MCP_PROTOCOL_VERSION_HEADER.encode("latin-1"))
         requested_version = (
             raw_version_bytes.decode("latin-1").strip() if raw_version_bytes else None
         )
 
         # 1. Handle OPTIONS discovery / CORS preflight
-        if scope.get("method") == "OPTIONS":
+        if is_mcp_path and scope.get("method") == "OPTIONS":
             cors_headers = (
                 "Content-Type, Accept, MCP-Protocol-Version, MCP-Session-Id, Authorization"
             )
@@ -93,7 +95,11 @@ class ProtocolNegotiationMiddleware:
 
         # 3. Handle plain GET discovery probe (clients querying without text/event-stream)
         accept_header = headers.get(b"accept", b"").decode("latin-1").lower()
-        if scope.get("method") == "GET" and "text/event-stream" not in accept_header:
+        if (
+            is_mcp_path
+            and scope.get("method") == "GET"
+            and "text/event-stream" not in accept_header
+        ):
             discovery_data = {
                 "name": "telegram",
                 "version": "2.0.1",
@@ -149,7 +155,7 @@ def patch_fastmcp_streamable_http() -> None:
 
         def wrapped_streamable_http_app(self: Any, *args: Any, **kwargs: Any) -> Any:
             app = original_streamable_http_app(self, *args, **kwargs)
-            return ProtocolNegotiationMiddleware(app)
+            return ProtocolNegotiationMiddleware(app, self.settings.streamable_http_path)
 
         FastMCP.streamable_http_app = wrapped_streamable_http_app  # type: ignore[assignment]
         FastMCP._protocol_negotiation_patched = True  # type: ignore[attr-defined]
@@ -171,7 +177,7 @@ def create_streamable_http_app(mcp_instance: Any) -> Any:
     app = mcp_instance.streamable_http_app()
     # If not already wrapped via monkeypatch
     if not isinstance(app, ProtocolNegotiationMiddleware):
-        app = ProtocolNegotiationMiddleware(app)
+        app = ProtocolNegotiationMiddleware(app, mcp_instance.settings.streamable_http_path)
     return app
 
 
@@ -197,3 +203,29 @@ async def run_streamable_http_async(mcp_instance: Any) -> None:
     )
     server = uvicorn.Server(config)
     await server.serve()
+
+
+def install_events_adapter(
+    app: Any,
+    service: Any,
+    *,
+    principal_resolver: Any,
+    transport_security: Any,
+    mcp_path: str = "/mcp",
+) -> Any:
+    """Install outside discovery, using the same trusted auth resolver as tools.
+
+    The resolver returns event_bridge.protocol.EventPrincipal or None. A restricted
+    context token supplies a frozen watch allowlist. Supply the FastMCP instance's
+    transport_security settings so custom methods keep its Host/Origin policy.
+    Do not install when disabled.
+    """
+    from telegram_mcp.event_bridge.protocol import EventsMiddleware
+
+    return EventsMiddleware(
+        app,
+        service,
+        principal_resolver=principal_resolver,
+        transport_security=transport_security,
+        mcp_path=mcp_path,
+    )

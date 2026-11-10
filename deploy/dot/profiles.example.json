@@ -1,0 +1,17 @@
+{
+  "owner_id": "REPLACE_WITH_NUMERIC_ACCOUNT_ID",
+  "profiles": [
+    {
+      "id": "manual",
+      "kind": "manual",
+      "token": "",
+      "watch_ids": []
+    },
+    {
+      "id": "customer-context",
+      "kind": "context",
+      "token": "",
+      "watch_ids": ["REPLACE_WITH_EXPLICIT_WATCH_ID"]
+    }
+  ]
+}
