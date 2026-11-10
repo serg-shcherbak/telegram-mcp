@@ -62,10 +62,16 @@ def _voice():
     return msg
 
 
+def _context_messages(*source_messages):
+    by_id = {msg.id: msg for msg in source_messages}
+    return lambda entity, **kwargs: by_id.get(kwargs["ids"]) if "ids" in kwargs else []
+
+
 @pytest.fixture
 def client(monkeypatch):
     cl = AsyncMock()
     cl._mb_entity_cache = MagicMock()
+    cl._mb_entity_cache.self_id = 42
     cl._mb_entity_cache.get.return_value = None
     monkeypatch.setattr(messages, "get_client", lambda account=None: cl)
     monkeypatch.setattr(
@@ -107,7 +113,7 @@ async def test_json_readers_return_the_complete_record(client, tool, arguments):
             ],
         )
     if tool is messages.get_message_context:
-        client.get_messages.side_effect = [[], msg, []]
+        client.get_messages.side_effect = _context_messages(msg)
 
     record = json.loads(await tool(**arguments, account="test"))["results"][0]
 
@@ -138,7 +144,7 @@ async def test_search_global_keeps_chat_attribution(client):
 @pytest.mark.asyncio
 async def test_context_keeps_target_marker(client):
     msg = _post()
-    client.get_messages.side_effect = [[], msg, []]
+    client.get_messages.side_effect = _context_messages(msg)
 
     result = json.loads(await messages.get_message_context(MARKED_CHANNEL_ID, 1, account="test"))
 
@@ -148,13 +154,21 @@ async def test_context_keeps_target_marker(client):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("tool", ["search_global", "get_message_context"])
 async def test_cached_voice_transcript_is_part_of_the_record(client, transcript_cache_dir, tool):
-    transcription.save_transcript(MARKED_CHANNEL_ID, 1, "groq", "Hello there", duration=13)
     voice = _voice()
+    voice._client = client
+    transcription.save_transcript(
+        MARKED_CHANNEL_ID,
+        1,
+        "groq",
+        "Hello there",
+        duration=13,
+        identity=transcription.transcript_identity(voice, MARKED_CHANNEL_ID, "groq", client),
+    )
     if tool == "search_global":
         client.return_value = SimpleNamespace(messages=[voice], users=[], chats=[])
         result = await messages.search_global("Hello", account="test")
     else:
-        client.get_messages.side_effect = [[], voice, []]
+        client.get_messages.side_effect = _context_messages(voice)
         result = await messages.get_message_context(MARKED_CHANNEL_ID, 1, account="test")
 
     record = json.loads(result)["results"][0]

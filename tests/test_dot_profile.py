@@ -16,6 +16,7 @@ from mcp.server.fastmcp import FastMCP
 from telethon import types
 
 from telegram_mcp import access, runtime
+from telegram_mcp import transcription
 from telegram_mcp.tools import chats, messages
 from telegram_mcp.transport.http import create_streamable_http_app
 
@@ -147,6 +148,687 @@ async def _session(app, token):
 
 def _text(result):
     return "\n".join(getattr(item, "text", "") for item in result.content)
+
+
+@pytest.fixture
+def direct_audio(owner_config, core_client, monkeypatch, transcript_cache_dir):
+    from datetime import datetime, timezone
+
+    path, data = owner_config
+    data["profiles"]["reader"]["external_asr"] = [1]
+    _write_config(path, data)
+    monkeypatch.setenv("TELEGRAM_TRANSCRIBE_OPENAI_URL", "https://api.openai.com/v1")
+    monkeypatch.setenv("TELEGRAM_TRANSCRIBE_OPENAI_API_KEY", "synthetic-key")
+    monkeypatch.setenv("TELEGRAM_TRANSCRIBE_OPENAI_MODEL", "synthetic-model")
+    msg = types.Message(
+        id=7,
+        peer_id=types.PeerUser(1),
+        date=datetime.now(timezone.utc),
+        message="",
+        media=types.MessageMediaDocument(
+            document=types.Document(
+                id=101,
+                access_hash=0,
+                file_reference=b"synthetic",
+                date=None,
+                mime_type="audio/mpeg",
+                size=12,
+                dc_id=1,
+                attributes=[types.DocumentAttributeAudio(duration=5, voice=False)],
+            )
+        ),
+    )
+    state = {
+        "message": msg,
+        "engines": [],
+        "fetches": 0,
+        "real_transcribe": transcription.transcribe,
+    }
+
+    async def fetch(entity, **kwargs):
+        state["fetches"] += 1
+        return state["message"] if "ids" in kwargs else [state["message"]]
+
+    async def provider(cl, entity, source, engine):
+        state["engines"].append(engine)
+        return {"status": "ok", "text": "synthetic transcript"}
+
+    monkeypatch.setattr(core_client, "get_messages", fetch)
+    monkeypatch.setattr(transcription, "transcribe", provider)
+    return state
+
+
+@pytest.mark.asyncio
+async def test_direct_audio_uses_openai_without_attachment_export_grant(
+    owner_config, core_client, direct_audio
+):
+    path, _ = owner_config
+    async with _server(path) as (_, app):
+        async with _session(app, TOKEN_A) as session:
+            names = {tool.name for tool in (await session.list_tools()).tools}
+            assert {"transcribe_voice", "get_message_context", "list_messages"} <= names
+            assert "export_attachment" not in names
+            first = await session.call_tool("transcribe_voice", {"chat_id": 1, "message_id": 7})
+            assert not first.isError, _text(first)
+            payload = json.loads(_text(first))
+            assert payload["source"] == "openai"
+            assert payload["complete"] is True
+            assert payload["fallback_reason"] is None
+            second = await session.call_tool("transcribe_voice", {"chat_id": 1, "message_id": 7})
+            assert json.loads(_text(second))["cached"] is True
+            assert direct_audio["fetches"] >= 2
+    assert direct_audio["engines"] == ["openai"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "change", ["no_opt_in", "no_read", "wrong_profile", "wrong_source", "removed_source"]
+)
+async def test_direct_audio_warm_cache_cannot_bypass_current_source_and_scope(
+    owner_config, core_client, direct_audio, change
+):
+    path, data = owner_config
+    async with _server(path) as (_, app):
+        async with _session(app, TOKEN_A) as session:
+            first = await session.call_tool("transcribe_voice", {"chat_id": 1, "message_id": 7})
+            assert not first.isError, _text(first)
+            if change == "no_opt_in":
+                data["profiles"]["reader"]["external_asr"] = []
+            elif change == "no_read":
+                data["profiles"]["reader"]["read"] = []
+            elif change == "wrong_source":
+                direct_audio["message"].peer_id = types.PeerUser(2)
+            elif change == "wrong_profile":
+                pass
+            else:
+                direct_audio["message"] = None
+            _write_config(path, data)
+            if change == "wrong_profile":
+                async with _session(app, TOKEN_B) as other:
+                    denied = await other.call_tool(
+                        "transcribe_voice", {"chat_id": 1, "message_id": 7}
+                    )
+            else:
+                denied = await session.call_tool(
+                    "transcribe_voice", {"chat_id": 1, "message_id": 7}
+                )
+            assert denied.isError, _text(denied)
+            assert "synthetic transcript" not in _text(denied)
+    assert direct_audio["engines"] == ["openai"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("engine", ["groq", "whisper", "telegram"])
+async def test_private_audio_cannot_choose_another_provider(
+    owner_config, core_client, direct_audio, engine
+):
+    path, _ = owner_config
+    async with _server(path) as (_, app):
+        async with _session(app, TOKEN_A) as session:
+            result = await session.call_tool(
+                "transcribe_voice", {"chat_id": 1, "message_id": 7, "engine": engine}
+            )
+            assert result.isError
+    assert direct_audio["engines"] == []
+
+
+@pytest.mark.asyncio
+async def test_history_never_starts_asr_or_returns_unpermitted_transcripts(
+    owner_config, core_client, direct_audio, monkeypatch
+):
+    path, data = owner_config
+    async with _server(path) as (_, app):
+        async with _session(app, TOKEN_A) as session:
+            await session.call_tool("transcribe_voice", {"chat_id": 1, "message_id": 7})
+            data["profiles"]["reader"]["external_asr"] = []
+            _write_config(path, data)
+            monkeypatch.setenv("TELEGRAM_TRANSCRIBE", "auto")
+            result = await session.call_tool("list_messages", {"chat_id": 1})
+            assert not result.isError, _text(result)
+            assert "synthetic transcript" not in _text(result)
+    assert direct_audio["engines"] == ["openai"]
+
+
+@pytest.mark.asyncio
+async def test_asr_revocation_during_provider_withholds_and_does_not_cache(
+    owner_config, core_client, direct_audio, monkeypatch
+):
+    path, data = owner_config
+
+    async def revoked(*args):
+        data["profiles"]["reader"]["external_asr"] = []
+        _write_config(path, data)
+        return {"status": "ok", "text": "withheld transcript"}
+
+    monkeypatch.setattr(transcription, "transcribe", revoked)
+    async with _server(path) as (_, app):
+        async with _session(app, TOKEN_A) as session:
+            result = await session.call_tool("transcribe_voice", {"chat_id": 1, "message_id": 7})
+            assert result.isError
+            assert "withheld transcript" not in _text(result)
+    assert transcription.get_cached_transcript(1, 7) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "change", ["model", "language", "attachment", "account", "session_account", "expiry"]
+)
+async def test_direct_audio_cache_identity_and_retention(
+    owner_config, core_client, direct_audio, monkeypatch, change
+):
+    import sqlite3
+
+    path, data = owner_config
+    async with _server(path) as (_, app):
+        async with _session(app, TOKEN_A) as session:
+            first = await session.call_tool("transcribe_voice", {"chat_id": 1, "message_id": 7})
+            assert not first.isError, _text(first)
+            if change == "model":
+                monkeypatch.setenv("TELEGRAM_TRANSCRIBE_OPENAI_MODEL", "changed-model")
+            elif change == "language":
+                monkeypatch.setenv("TELEGRAM_TRANSCRIBE_LANGUAGE", "ru")
+            elif change == "attachment":
+                direct_audio["message"].media.document.id += 1
+            elif change == "account":
+                data["owner_id"] = 3
+                _write_config(path, data)
+            elif change == "session_account":
+                monkeypatch.setattr(
+                    core_client, "_mb_entity_cache", SimpleNamespace(self_id=2), raising=False
+                )
+            else:
+                with sqlite3.connect(transcription._cache_db_path()) as conn:
+                    conn.execute("UPDATE transcripts SET expires_at = 0")
+            second = await session.call_tool("transcribe_voice", {"chat_id": 1, "message_id": 7})
+            if change == "account":
+                assert second.isError
+            else:
+                assert not second.isError, _text(second)
+                assert json.loads(_text(second))["cached"] is False
+    assert len(direct_audio["engines"]) == (1 if change == "account" else 2)
+
+
+@pytest.mark.asyncio
+async def test_context_keeps_whole_mixed_album_and_private_forward_origin(
+    owner_config, core_client, direct_audio, monkeypatch
+):
+    from datetime import datetime, timezone
+
+    path, _ = owner_config
+    now = datetime.now(timezone.utc)
+    album = [
+        types.Message(
+            id=6,
+            peer_id=types.PeerUser(1),
+            date=now,
+            message="Whole post caption",
+            grouped_id=901,
+            media=types.MessageMediaPhoto(
+                photo=types.Photo(
+                    id=501, access_hash=0, file_reference=b"x", date=now, sizes=[], dc_id=1
+                )
+            ),
+            fwd_from=types.MessageFwdHeader(date=now, from_name="Private author"),
+        ),
+        types.Message(
+            id=7,
+            peer_id=types.PeerUser(1),
+            date=now,
+            message="Video caption",
+            grouped_id=901,
+            media=types.MessageMediaDocument(
+                document=types.Document(
+                    id=502,
+                    access_hash=0,
+                    file_reference=b"x",
+                    date=now,
+                    mime_type="video/mp4",
+                    size=12,
+                    dc_id=1,
+                    attributes=[types.DocumentAttributeVideo(duration=4, w=32, h=32)],
+                )
+            ),
+        ),
+    ]
+
+    async def fetch(entity, **kwargs):
+        if "ids" in kwargs:
+            return next((item for item in album if item.id == kwargs["ids"]), None)
+        if "max_id" in kwargs:
+            return [item for item in reversed(album) if item.id < kwargs["max_id"]]
+        return [item for item in album if item.id > kwargs["min_id"]]
+
+    monkeypatch.setattr(core_client, "get_messages", fetch)
+    async with _server(path) as (_, app):
+        async with _session(app, TOKEN_A) as session:
+            result = await session.call_tool(
+                "get_message_context", {"chat_id": 1, "message_id": 7, "context_size": 0}
+            )
+            assert not result.isError, _text(result)
+            payload = json.loads(_text(result)[_text(result).index("{") :])
+            assert [(row["id"], row["media_id"], row["media"]) for row in payload["results"]] == [
+                (6, "501", "photo"),
+                (7, "502", "video"),
+            ]
+            assert payload["results"][0]["text"] == "Whole post caption"
+            assert payload["results"][0]["forwarded"]["origin_status"] == "unknown"
+            assert all(row["source"]["chat_id"] == "1" for row in payload["results"])
+            assert payload["album"]["id"] == "901"
+            assert payload["album"]["complete"] is True
+    assert direct_audio["engines"] == []
+    assert core_client.sent == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["peer", "message"])
+async def test_context_rejects_a_changed_central_source(
+    owner_config, core_client, direct_audio, change
+):
+    path, _ = owner_config
+    if change == "peer":
+        direct_audio["message"].peer_id = types.PeerUser(2)
+    else:
+        direct_audio["message"].id = 8
+    async with _server(path) as (_, app):
+        async with _session(app, TOKEN_A) as session:
+            result = await session.call_tool(
+                "get_message_context", {"chat_id": 1, "message_id": 7, "context_size": 0}
+            )
+            assert result.isError
+            assert "synthetic transcript" not in _text(result)
+    assert direct_audio["engines"] == []
+
+
+def test_rich_post_keeps_missing_media_and_reports_incomplete_coverage():
+    from datetime import datetime, timezone
+
+    post = SimpleNamespace(
+        id=9,
+        date=datetime.now(timezone.utc),
+        message="",
+        sender=None,
+        rich_message=SimpleNamespace(
+            blocks=[SimpleNamespace(photo_id=1), SimpleNamespace(video_id=2)],
+            photos=[SimpleNamespace(id=1)],
+            documents=[],
+        ),
+    )
+    record = messages.message_to_dict(post, chat_id=-1000000000010)
+    assert record["rich_media"] == [{"type": "photo", "id": 1}, {"type": "video", "id": 2}]
+    assert record["media_coverage"]["complete"] is False
+    assert record["media_coverage"]["missing_media_ids"] == ["2"]
+    assert record["source"]["link"].endswith("/c/10/9")
+
+
+def test_long_post_reports_existing_text_truncation_explicitly():
+    from datetime import datetime, timezone
+
+    source = SimpleNamespace(
+        id=4, date=datetime.now(timezone.utc), message="x" * 5000, sender=None
+    )
+    record = messages.message_to_dict(source, chat_id=1)
+    assert record["text_coverage"] == {
+        "complete": False,
+        "characters_available": 5000,
+        "characters_returned": 4096,
+    }
+    assert record["text"].endswith("[truncated]")
+
+
+def test_private_context_keeps_large_rich_media_and_album_ids_exact(owner_config):
+    from datetime import datetime, timezone
+
+    path, _ = owner_config
+    config = access.load_access_config(path)
+    large_id = 9223372036854775806
+    source = SimpleNamespace(
+        id=4,
+        date=datetime.now(timezone.utc),
+        message="Post",
+        sender=None,
+        grouped_id=large_id,
+        rich_message=SimpleNamespace(
+            blocks=[SimpleNamespace(photo_id=large_id)],
+            photos=[SimpleNamespace(id=large_id)],
+            documents=[],
+        ),
+    )
+    token = access.current_connection.set(
+        access.AuthenticatedConnection(path, config, config.profiles[0])
+    )
+    try:
+        record = messages.message_to_dict(source, chat_id=1)
+    finally:
+        access.current_connection.reset(token)
+    assert record["rich_media"][0]["id"] == str(large_id)
+    assert record["grouped_id"] == str(large_id)
+
+
+@pytest.mark.parametrize("saved", [False, True])
+def test_forward_author_does_not_invent_a_private_origin(saved):
+    from datetime import datetime, timezone
+
+    header = types.MessageFwdHeader(date=datetime.now(timezone.utc), from_id=types.PeerUser(42))
+    if saved:
+        header.saved_from_peer, header.saved_from_msg_id = types.PeerChat(9), 81
+    source = SimpleNamespace(
+        id=10,
+        date=header.date,
+        message="Forward",
+        sender=None,
+        fwd_from=header,
+        forward=SimpleNamespace(chat_id=42, sender=SimpleNamespace(first_name="Author")),
+    )
+    forwarded = messages.message_to_dict(source, chat_id=1)["forwarded"]
+    assert forwarded["origin_status"] == ("known" if saved else "unknown")
+    if saved:
+        assert forwarded["source_chat_id"] == -9
+        assert forwarded["source_message_id"] == 81
+    else:
+        assert "source_chat_id" not in forwarded
+
+
+def test_empty_forward_header_keeps_public_shape_and_private_unknown(owner_config):
+    source = SimpleNamespace(
+        id=10,
+        date=None,
+        message="Forward",
+        sender=None,
+        fwd_from=types.MessageFwdHeader(date=None),
+    )
+    assert messages.message_to_dict(source)["forwarded"] is True
+    path, _ = owner_config
+    config = access.load_access_config(path)
+    token = access.current_connection.set(
+        access.AuthenticatedConnection(path, config, config.profiles[0])
+    )
+    try:
+        assert messages.message_to_dict(source)["forwarded"] == {"origin_status": "unknown"}
+    finally:
+        access.current_connection.reset(token)
+
+
+def test_private_openai_default_preserves_generic_core_default(
+    owner_config, direct_audio, monkeypatch
+):
+    path, _ = owner_config
+    monkeypatch.delenv("TELEGRAM_TRANSCRIBE_OPENAI_MODEL")
+    assert transcription.http_engine_config("openai").model == "whisper-1"
+    config = access.load_access_config(path)
+    token = access.current_connection.set(
+        access.AuthenticatedConnection(path, config, config.profiles[0])
+    )
+    try:
+        assert transcription.http_engine_config("openai").model == "gpt-transcribe"
+    finally:
+        access.current_connection.reset(token)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "media,status,expected_source,expected_reason",
+    [
+        ("voice", 503, "telegram", None),
+        ("video_note", 503, "telegram", None),
+        ("audio", 503, "openai", "native_unsupported_media"),
+        ("voice", 401, "openai", "provider_credentials"),
+        ("voice", 413, "openai", "too_large"),
+        ("voice", "timeout", "openai", "provider_outcome_unknown"),
+    ],
+)
+async def test_private_provider_fallback_and_specific_failures(
+    owner_config,
+    core_client,
+    direct_audio,
+    monkeypatch,
+    media,
+    status,
+    expected_source,
+    expected_reason,
+):
+    path, _ = owner_config
+    source = direct_audio["message"]
+    if media == "voice":
+        source.document.attributes = [types.DocumentAttributeAudio(duration=5, voice=True)]
+    elif media == "video_note":
+        source.document.attributes = [
+            types.DocumentAttributeVideo(duration=5, w=32, h=32, round_message=True)
+        ]
+    posts, native, downloads = [], [], []
+
+    async def download(*args, **kwargs):
+        downloads.append(1)
+        return b"syntheticwav"
+
+    class Provider:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def post(self, url, **kwargs):
+            posts.append(url)
+            if status == "timeout":
+                raise httpx.ReadTimeout("secret-shaped-provider-details")
+            return httpx.Response(status, request=httpx.Request("POST", url), json={})
+
+    async def telegram(*args):
+        native.append(1)
+        return {"status": "ok", "text": "Native result"}
+
+    monkeypatch.setattr(transcription, "transcribe", direct_audio["real_transcribe"])
+    monkeypatch.setattr(core_client, "download_media", download, raising=False)
+    # Use a separate HTTP module facade; the test's real MCP client uses httpx too.
+    monkeypatch.setattr(
+        transcription,
+        "httpx",
+        SimpleNamespace(
+            AsyncClient=lambda **kwargs: Provider(),
+            HTTPStatusError=httpx.HTTPStatusError,
+            ConnectError=httpx.ConnectError,
+        ),
+    )
+    monkeypatch.setattr(transcription, "_transcribe_via_telegram", telegram)
+    async with _server(path) as (_, app):
+        async with _session(app, TOKEN_A) as session:
+            result = await session.call_tool("transcribe_voice", {"chat_id": 1, "message_id": 7})
+            payload = json.loads(_text(result)[_text(result).index("{") :])
+            assert "secret-shaped" not in _text(result)
+            assert payload["source"] == expected_source
+            assert result.isError == (expected_reason is not None)
+            if expected_reason is None:
+                assert payload["complete"] is True
+                assert payload["fallback_reason"] == "provider_unavailable"
+                assert native == [1]
+            else:
+                assert payload["reason"] == expected_reason
+                assert payload["complete"] is False
+                assert native == []
+    assert len(posts) == 1
+    assert downloads == [1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["endpoint", "key", "opt_in", "size"])
+async def test_private_audio_preflight_never_downloads_or_calls_provider(
+    owner_config, core_client, direct_audio, monkeypatch, change
+):
+    path, data = owner_config
+    if change == "endpoint":
+        monkeypatch.setenv("TELEGRAM_TRANSCRIBE_OPENAI_URL", "https://unapproved.invalid/v1")
+    elif change == "key":
+        monkeypatch.delenv("TELEGRAM_TRANSCRIBE_OPENAI_API_KEY")
+    elif change == "opt_in":
+        data["profiles"]["reader"]["external_asr"] = []
+        _write_config(path, data)
+    else:
+        direct_audio["message"].document.size = 24_000_001
+
+    async def forbidden(*args, **kwargs):
+        raise AssertionError("Provider and download must not be called")
+
+    monkeypatch.setattr(transcription, "transcribe", direct_audio["real_transcribe"])
+    monkeypatch.setattr(core_client, "download_media", forbidden, raising=False)
+    async with _server(path) as (_, app):
+        async with _session(app, TOKEN_A) as session:
+            result = await session.call_tool("transcribe_voice", {"chat_id": 1, "message_id": 7})
+            assert result.isError, _text(result)
+            if change == "size":
+                assert "too_large" in _text(result)
+
+
+@pytest.mark.asyncio
+async def test_unknown_send_result_is_not_repeated_or_reconciled_without_read(
+    owner_config, core_client, monkeypatch
+):
+    path, data = owner_config
+    data["profiles"]["sender"]["read"] = []
+    _write_config(path, data)
+
+    async def unknown(entity, text, **kwargs):
+        core_client.sent.append((entity.id, text, kwargs.get("reply_to")))
+        raise TimeoutError("synthetic uncertain send")
+
+    monkeypatch.setattr(core_client, "send_message", unknown)
+    async with _server(path) as (_, app):
+        async with _session(app, TOKEN_B) as session:
+            result = await session.call_tool(
+                "send_message", {"chat_id": 2, "message": "synthetic", "reply_to": 9}
+            )
+            assert result.isError
+            assert "unknown" in _text(result)
+            assert "Do not resend" in _text(result)
+    assert core_client.sent == [(2, "synthetic", 9)]
+    assert core_client.content_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_cancelled_asr_releases_input_and_does_not_store_text(
+    owner_config, core_client, direct_audio, monkeypatch, transcript_cache_dir
+):
+    path, _ = owner_config
+    config = access.load_access_config(path)
+    entered, closed = asyncio.Event(), asyncio.Event()
+
+    async def download(*args, **kwargs):
+        return b"synthetic-input"
+
+    class Provider:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            closed.set()
+
+        async def post(self, *args, **kwargs):
+            entered.set()
+            await asyncio.Event().wait()
+
+    monkeypatch.setattr(transcription, "transcribe", direct_audio["real_transcribe"])
+    monkeypatch.setattr(core_client, "download_media", download, raising=False)
+    monkeypatch.setattr(
+        transcription,
+        "httpx",
+        SimpleNamespace(
+            AsyncClient=lambda **kwargs: Provider(),
+            HTTPStatusError=httpx.HTTPStatusError,
+            ConnectError=httpx.ConnectError,
+        ),
+    )
+    token = access.current_connection.set(
+        access.AuthenticatedConnection(path, config, config.profiles[0])
+    )
+    try:
+        server = access.DotMCP(path, runtime.mcp)
+        task = asyncio.create_task(
+            server.call_tool("transcribe_voice", {"chat_id": 1, "message_id": 7})
+        )
+        await asyncio.wait_for(entered.wait(), 1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert closed.is_set()
+        assert transcription._INFLIGHT_LOCKS == {}
+    finally:
+        access.current_connection.reset(token)
+    assert transcription.get_cached_transcript(1, 7) is None
+    assert list(config.media_root.iterdir()) == []
+    assert {item.name for item in transcript_cache_dir.iterdir()} == {"transcripts.db"}
+
+
+@pytest.mark.asyncio
+async def test_revocation_during_download_prevents_external_dispatch(
+    owner_config, core_client, direct_audio, monkeypatch
+):
+    path, data = owner_config
+    posts = []
+
+    async def download(*args, **kwargs):
+        data["profiles"]["reader"]["external_asr"] = []
+        _write_config(path, data)
+        return b"synthetic-input"
+
+    async def forbidden(*args, **kwargs):
+        posts.append(1)
+        raise AssertionError("ASR dispatch after revocation")
+
+    monkeypatch.setattr(transcription, "transcribe", direct_audio["real_transcribe"])
+    monkeypatch.setattr(core_client, "download_media", download, raising=False)
+    monkeypatch.setattr(transcription.httpx.AsyncClient, "post", forbidden)
+    config = access.load_access_config(path)
+    token = access.current_connection.set(
+        access.AuthenticatedConnection(path, config, config.profiles[0])
+    )
+    try:
+        with pytest.raises(runtime.ToolError):
+            await access.DotMCP(path, runtime.mcp).call_tool(
+                "transcribe_voice", {"chat_id": 1, "message_id": 7}
+            )
+    finally:
+        access.current_connection.reset(token)
+    assert posts == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["attachment", "deleted"])
+async def test_source_change_during_download_prevents_external_dispatch(
+    owner_config, core_client, direct_audio, monkeypatch, change
+):
+    path, _ = owner_config
+    posts = []
+
+    async def download(*args, **kwargs):
+        if change == "attachment":
+            direct_audio["message"].document.id += 1
+        else:
+            direct_audio["message"] = None
+        return b"synthetic-input"
+
+    async def post(*args, **kwargs):
+        posts.append(1)
+        return httpx.Response(
+            200,
+            request=httpx.Request("POST", "https://api.openai.com/v1/audio/transcriptions"),
+            json={"text": "Withdrawn source must not leave Telegram"},
+        )
+
+    monkeypatch.setattr(transcription, "transcribe", direct_audio["real_transcribe"])
+    monkeypatch.setattr(core_client, "download_media", download, raising=False)
+    monkeypatch.setattr(transcription.httpx.AsyncClient, "post", post)
+    config = access.load_access_config(path)
+    token = access.current_connection.set(
+        access.AuthenticatedConnection(path, config, config.profiles[0])
+    )
+    try:
+        with pytest.raises(runtime.ToolError):
+            await access.DotMCP(path, runtime.mcp).call_tool(
+                "transcribe_voice", {"chat_id": 1, "message_id": 7}
+            )
+    finally:
+        access.current_connection.reset(token)
+    assert posts == []
+    assert transcription.get_cached_transcript(1, 7) is None
 
 
 @pytest.mark.asyncio
@@ -384,6 +1066,7 @@ async def test_nullable_list_and_operational_failures_use_sdk_errors(owner_confi
             result = await reader.call_tool("list_chats", {})
             assert result.isError
             assert "7 seconds" in _text(result)
+            assert "incomplete" in _text(result).lower()
 
 
 @pytest.mark.asyncio

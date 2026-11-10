@@ -102,7 +102,14 @@ def test_message_to_dict_voice_cache_hit_includes_source_and_note(
     monkeypatch, transcript_cache_dir
 ):
     monkeypatch.setenv("TELEGRAM_TRANSCRIBE", "on-demand")
-    transcription.save_transcript(1, 5, "groq", "hello there", duration=23)
+    transcription.save_transcript(
+        1,
+        5,
+        "groq",
+        "hello there",
+        duration=23,
+        identity=transcription.transcript_identity(_voice_msg(id=5), 1, "groq"),
+    )
 
     d = message_to_dict(_voice_msg(id=5), chat_id=1)
 
@@ -114,7 +121,13 @@ def test_message_to_dict_voice_cache_hit_includes_source_and_note(
 
 def test_message_to_dict_voice_off_mode_shows_duration_only(monkeypatch, transcript_cache_dir):
     monkeypatch.setenv("TELEGRAM_TRANSCRIBE", "off")
-    transcription.save_transcript(1, 5, "groq", "must not surface")
+    transcription.save_transcript(
+        1,
+        5,
+        "groq",
+        "must not surface",
+        identity=transcription.transcript_identity(_voice_msg(id=5), 1, "groq"),
+    )
 
     d = message_to_dict(_voice_msg(id=5), chat_id=1)
 
@@ -147,7 +160,13 @@ def test_format_message_line_voice_ready_includes_transcript_and_source(
     monkeypatch, transcript_cache_dir
 ):
     monkeypatch.setenv("TELEGRAM_TRANSCRIBE", "on-demand")
-    transcription.save_transcript(1, 5, "telegram", "we should ship this")
+    transcription.save_transcript(
+        1,
+        5,
+        "telegram",
+        "we should ship this",
+        identity=transcription.transcript_identity(_voice_msg(id=5), 1, "telegram"),
+    )
 
     line = format_message_line(_voice_msg(id=5), chat_id=1)
 
@@ -195,7 +214,14 @@ async def test_list_messages_voice_shows_media_label_and_cached_transcript(
     monkeypatch.setenv("TELEGRAM_TRANSCRIBE", "on-demand")
     entity = SimpleNamespace()
     voice_msg = _voice_msg(id=7)
-    transcription.save_transcript(555, 7, "groq", "we should ship this", duration=23)
+    transcription.save_transcript(
+        555,
+        7,
+        "groq",
+        "we should ship this",
+        duration=23,
+        identity=transcription.transcript_identity(_voice_msg(id=7), 555, "groq"),
+    )
     client = _FakeClient(messages_list=[voice_msg])
     _patch_client(monkeypatch, client, entity, 555)
 
@@ -272,7 +298,13 @@ async def test_get_history_fills_cached_transcript(monkeypatch, transcript_cache
     entity = SimpleNamespace()
     client = _FakeClient(messages_list=[_voice_msg(id=7)])
     _patch_client(monkeypatch, client, entity, 555)
-    transcription.save_transcript(555, 7, "telegram", "hello from cache")
+    transcription.save_transcript(
+        555,
+        7,
+        "telegram",
+        "hello from cache",
+        identity=transcription.transcript_identity(_voice_msg(id=7), 555, "telegram"),
+    )
 
     result = await messages.get_history(chat_id=555, limit=10, account=None)
 
@@ -288,7 +320,13 @@ async def test_get_messages_fills_cached_transcript_in_text_line(
     entity = SimpleNamespace()
     client = _FakeClient(messages_list=[_voice_msg(id=7)])
     _patch_client(monkeypatch, client, entity, 555)
-    transcription.save_transcript(555, 7, "groq", "cached line text")
+    transcription.save_transcript(
+        555,
+        7,
+        "groq",
+        "cached line text",
+        identity=transcription.transcript_identity(_voice_msg(id=7), 555, "groq"),
+    )
 
     result = await messages.get_messages(chat_id=555, page=1, page_size=10, account=None)
 
@@ -313,11 +351,16 @@ async def test_transcribe_voice_disabled_by_toggle(monkeypatch, transcript_cache
 
 
 @pytest.mark.asyncio
-async def test_transcribe_voice_returns_cached_without_calling_engine(
-    monkeypatch, transcript_cache_dir
-):
+async def test_transcribe_voice_cache_requires_a_current_source(monkeypatch, transcript_cache_dir):
     monkeypatch.setenv("TELEGRAM_TRANSCRIBE", "on-demand")
-    transcription.save_transcript(555, 42, "groq", "cached text", duration=23)
+    transcription.save_transcript(
+        555,
+        42,
+        "groq",
+        "cached text",
+        duration=23,
+        identity=transcription.transcript_identity(_voice_msg(id=42), 555, "groq"),
+    )
     entity = SimpleNamespace()
     client = _FakeClient()
     _patch_client(monkeypatch, client, entity, 555)
@@ -329,15 +372,8 @@ async def test_transcribe_voice_returns_cached_without_calling_engine(
 
     result = await messages.transcribe_voice(chat_id=555, message_id=42, account=None)
 
-    payload = json.loads(result)
-    assert payload == {
-        "transcribed": True,
-        "cached": True,
-        "text": "cached text",
-        "source": "groq",
-        "duration": 23,
-        "note": "Machine transcript, not a verbatim quote.",
-    }
+    assert "not found" in result
+    assert "cached text" not in result
 
 
 @pytest.mark.asyncio
@@ -508,7 +544,13 @@ async def test_transcribe_voice_openai_caches_under_its_own_engine(
 ):
     monkeypatch.setenv("TELEGRAM_TRANSCRIBE", "on-demand")
     monkeypatch.setenv("TELEGRAM_TRANSCRIBE_OPENAI_URL", "http://localhost:5092/v1")
-    transcription.save_transcript(1, 5, "groq", "groq text")
+    transcription.save_transcript(
+        1,
+        5,
+        "groq",
+        "groq text",
+        identity=transcription.transcript_identity(_voice_msg(id=5), 1, "groq"),
+    )
     monkeypatch.setattr(
         transcription,
         "transcribe",

@@ -318,6 +318,10 @@ def message_to_dict(msg, chat_id: Optional[int] = None, forum: bool = False) -> 
     per response, see topics_for_messages.
     """
     d = {"id": msg.id, "sender": get_sender_name(msg), "date": msg.date}
+    if chat_id is not None:
+        d["source"] = {"chat_id": str(chat_id), "message_id": msg.id}
+        if chat_id < -(10**12):
+            d["source"]["link"] = f"https://{LINK_DOMAIN}/c/{-chat_id - 10**12}/{msg.id}"
 
     sender_id = getattr(msg, "sender_id", None)
     if sender_id is not None:
@@ -339,6 +343,13 @@ def message_to_dict(msg, chat_id: Optional[int] = None, forum: bool = False) -> 
             rich = True
     if text:
         d["text"] = text
+    raw_text = getattr(msg, "message", None) or rich_message_text(msg)
+    if len(raw_text) > 4096:
+        d["text_coverage"] = {
+            "complete": False,
+            "characters_available": len(raw_text),
+            "characters_returned": 4096,
+        }
     if rich:
         d["rich"] = True  # text rebuilt from page blocks, not a verbatim .message
     d.update(get_custom_emoji_metadata(msg))
@@ -346,11 +357,22 @@ def message_to_dict(msg, chat_id: Optional[int] = None, forum: bool = False) -> 
     media_label = get_media_label(msg)
     if media_label:
         d["media"] = media_label
+    attachment = getattr(msg, "document", None) or getattr(msg, "photo", None)
+    if attachment is not None and getattr(attachment, "id", None) is not None:
+        d["media_id"] = str(attachment.id)
     rich_media = rich_message_media(msg)
     if rich_media:
         # ids the media tools accept back as media_id (get_media_info resolves
         # them against rich_message.photos/documents)
-        d["rich_media"] = [{"type": m["type"], "id": m["id"]} for m in rich_media]
+        d["rich_media"] = [
+            {
+                "type": m["type"],
+                "id": str(m["id"]) if current_connection.get() is not None else m["id"],
+            }
+            for m in rich_media
+        ]
+        missing = [str(media["id"]) for media in rich_media if media["media"] is None]
+        d["media_coverage"] = {"complete": not missing, "missing_media_ids": missing}
 
     page = getattr(msg, "web_preview", None)
     if page is not None and getattr(page, "url", None):
@@ -381,7 +403,7 @@ def message_to_dict(msg, chat_id: Optional[int] = None, forum: bool = False) -> 
 
     grouped_id = getattr(msg, "grouped_id", None)
     if grouped_id:
-        d["grouped_id"] = grouped_id  # album: messages sharing one grouped_id form a single group
+        d["grouped_id"] = str(grouped_id) if current_connection.get() is not None else grouped_id
 
     topic_id = message_topic_id(msg, forum)
     if topic_id:
@@ -457,6 +479,17 @@ def message_to_dict(msg, chat_id: Optional[int] = None, forum: bool = False) -> 
                 )
 
         d["forwarded"] = finfo or True
+        saved_peer = getattr(fwd, "saved_from_peer", None)
+        saved_message = getattr(fwd, "saved_from_msg_id", None)
+        if saved_peer is not None and saved_message is not None:
+            finfo["source_chat_id"] = get_marked_id(saved_peer)
+            finfo["source_message_id"] = saved_message
+        elif isinstance(getattr(fwd, "from_id", None), types.PeerChannel) and post_id is not None:
+            finfo["source_chat_id"] = get_marked_id(fwd.from_id)
+            finfo["source_message_id"] = post_id
+        if finfo or current_connection.get() is not None:
+            finfo["origin_status"] = "known" if "source_chat_id" in finfo else "unknown"
+            d["forwarded"] = finfo
 
     via_bot_id = getattr(msg, "via_bot_id", None)
     if via_bot_id:
@@ -505,6 +538,24 @@ def format_message_line(msg, chat_id: Optional[int] = None, forum: bool = False)
     see message_to_dict for why it's optional.
     """
     parts = [f"ID: {msg.id}", get_sender_info(msg), f"Date: {msg.date}"]
+    if chat_id is not None:
+        source = {"chat_id": str(chat_id), "message_id": msg.id}
+        if chat_id < -(10**12):
+            source["link"] = f"https://{LINK_DOMAIN}/c/{-chat_id - 10**12}/{msg.id}"
+        attachment = getattr(msg, "document", None) or getattr(msg, "photo", None)
+        if getattr(attachment, "id", None) is not None:
+            source["media_id"] = str(attachment.id)
+        rich_media = rich_message_media(msg)
+        if rich_media:
+            source["rich_media"] = [
+                {
+                    "type": item["type"],
+                    "id": str(item["id"]),
+                    "available": item["media"] is not None,
+                }
+                for item in rich_media
+            ]
+        parts.append("source: " + json.dumps(source, ensure_ascii=False))
 
     topic_id = message_topic_id(msg, forum)
     if topic_id:
@@ -965,6 +1016,7 @@ async def send_message(
         reply_to: Optional id of a message in the same chat to reply to. To post
             in a forum topic, pass the topic id (from list_topics).
     """
+    dispatched = False
     try:
         cl = get_client(account)
         entity = await resolve_entity(chat_id, cl)
@@ -983,6 +1035,7 @@ async def send_message(
         if conflict:
             return conflict
         if parse_mode and parse_mode.lower() in RICH_PARSE_MODES:
+            dispatched = True
             return await _send_rich(cl, entity, message, parse_mode.lower(), reply_to=reply_to)
         if format_date or custom_emojis:
             entities, error = _plain_entities(message, format_date, custom_emojis)
@@ -990,6 +1043,7 @@ async def send_message(
                 return error
             import random
 
+            dispatched = True
             result = await cl(
                 functions.messages.SendMessageRequest(
                     peer=entity,
@@ -1002,10 +1056,21 @@ async def send_message(
                 )
             )
             return _sent_result(_first_sent_message_id(result))
+        dispatched = True
         sent = await cl.send_message(entity, message, parse_mode=parse_mode, reply_to=reply_to)
         return _sent_result(sent)
     except Exception as e:
-        return log_and_format_error("send_message", e, chat_id=chat_id)
+        return log_and_format_error(
+            "send_message",
+            e,
+            chat_id=chat_id,
+            user_message=(
+                "Send outcome is unknown. Do not resend. Reconcile only through already-authorized destination history; "
+                "if this connection cannot read it, report uncertainty without widening access."
+                if dispatched and not isinstance(e, telethon.errors.RPCError)
+                else None
+            ),
+        )
 
 
 def _first_sent_message_id(result) -> Optional[int]:
@@ -1580,7 +1645,7 @@ async def transcribe_voice(
     account: Optional[str] = None,
 ) -> str:
     """
-    Transcribe a voice message or video note (video circle) to text.
+    Transcribe a voice message, video note (video circle), or ordinary audio file to text.
 
     Engines (default TELEGRAM_TRANSCRIBE_ENGINE, otherwise "groq"):
     - "groq": Groq-hosted whisper-large-v3-turbo. Downloads the audio and
@@ -1598,11 +1663,10 @@ async def transcribe_voice(
     - "whisper": a local faster-whisper model on this server. Audio never
       leaves the machine; slower on CPU.
 
-    Results are cached per engine, by (chat_id, message_id, engine) - a
-    repeat call with the same engine returns the cached text without
-    hitting any engine again. Asking for an engine that has no cached
-    result transcribes with it, even when another engine's text is
-    already cached.
+    Cache identity includes account, canonical chat, message, attachment version,
+    provider/model and language. Every call checks the current source first.
+    Text expires after seven days by default; TELEGRAM_TRANSCRIPT_RETENTION_SECONDS
+    configures retention, with zero disabling storage.
 
     The returned text is a machine transcript, not a verbatim quote: proper
     names, punctuation and occasional words drift under every engine.
@@ -1625,41 +1689,39 @@ async def transcribe_voice(
         entity = await resolve_entity(chat_id, cl)
         numeric_chat_id = get_marked_id(entity)
 
-        chosen_engine = (engine or transcription.default_engine()).strip().lower()
+        private = current_connection.get() is not None
+        transcription.check_transcript_access(numeric_chat_id, operation=True)
+        if private and engine is not None and engine.strip().lower() != "openai":
+            raise ToolError("Dot ASR uses official OpenAI; engine override is not permitted")
+        chosen_engine = (
+            "openai" if private else (engine or transcription.default_engine()).strip().lower()
+        )
         if chosen_engine not in transcription.ENGINES:
             accepted = ", ".join(f"'{name}'" for name in sorted(transcription.ENGINES))
             return f"Invalid engine '{engine}'. Use one of: {accepted}."
 
-        # Pinned to the chosen engine on purpose: a cached telegram transcript
-        # must not answer a request for any other engine. The native engine drops the last
-        # speech segment and the loss cannot be seen in the text.
-        cached = transcription.get_cached_transcript(
-            numeric_chat_id, message_id, source=chosen_engine
-        )
-        if cached is not None:
-            return json.dumps(
-                {
-                    "transcribed": True,
-                    "cached": True,
-                    "text": cached["text"],
-                    "source": cached["source"],
-                    "duration": cached["duration"],
-                    "note": "Machine transcript, not a verbatim quote.",
-                },
-                ensure_ascii=False,
-                default=json_serializer,
-            )
-
         msg = await cl.get_messages(entity, ids=message_id)
         if not msg:
-            return f"Message {message_id} not found."
+            return log_and_format_error(
+                "transcribe_voice",
+                ValueError("Source unavailable"),
+                user_message=f"Message {message_id} not found.",
+            )
+        if msg.id != message_id:
+            raise ToolError("The requested audio source changed")
         if not transcription.is_transcribable(msg):
-            return f"Message {message_id} has no voice message or video note to transcribe."
-
+            return log_and_format_error(
+                "transcribe_voice",
+                ValueError("Unsupported media"),
+                user_message=f"Message {message_id} has no voice message, video note or audio file to transcribe.",
+            )
         config_error = transcription.engine_config_error(chosen_engine)
         if config_error:
-            return config_error
-
+            return log_and_format_error(
+                "transcribe_voice",
+                ValueError("ASR configuration"),
+                user_message=config_error,
+            )
         duration = transcription.voice_duration(msg)
         # Cache-first and locked by (chat, message, engine): two concurrent
         # calls for the same recording pay the engine once, not twice.
@@ -1667,25 +1729,43 @@ async def transcribe_voice(
             cl, entity, msg, chosen_engine, numeric_chat_id, duration=duration
         )
 
-        if result["status"] == "premium_required":
+        transcription.check_transcript_access(numeric_chat_id, operation=True)
+        if result["status"] == "premium_required" and not private:
             return premium_required_result("transcribe_voice (engine='telegram')")
-        if result["status"] == "pending":
-            return json.dumps(
+        if result["status"] != "ok":
+            reason = result.get("reason") or result["status"]
+            known = {
+                "pending",
+                "premium_required",
+                "provider_configuration",
+                "provider_credentials",
+                "provider_unavailable",
+                "provider_rejected",
+                "provider_outcome_unknown",
+                "too_large",
+                "native_unsupported_media",
+            }
+            reason = reason if reason in known else "transcription_failed"
+            failure = json.dumps(
                 {
                     "transcribed": False,
-                    "reason": "pending",
+                    "reason": reason,
+                    "source": result.get("source", chosen_engine),
+                    "complete": False,
+                    "fallback_reason": result.get("fallback_reason"),
                     "duration": duration,
-                    "detail": "Telegram is still processing this recording. Retry shortly.",
+                    "detail": (
+                        "Do not retry automatically; the provider outcome may be unknown."
+                        if reason == "provider_outcome_unknown"
+                        else "No complete transcript was produced."
+                    ),
                 },
                 ensure_ascii=False,
             )
-        if result["status"] == "error":
+            if result["status"] == "pending" and not private:
+                return failure
             return log_and_format_error(
-                "transcribe_voice",
-                RuntimeError(result.get("error", "unknown error")),
-                chat_id=chat_id,
-                message_id=message_id,
-                engine=chosen_engine,
+                "transcribe_voice", RuntimeError("ASR failed"), user_message=failure
             )
 
         # transcribe_cached already wrote the row; "cached" tells the caller
@@ -1697,11 +1777,15 @@ async def transcribe_voice(
                 "text": result["text"],
                 "source": result.get("source") or chosen_engine,
                 "duration": result.get("duration", duration),
+                "complete": result.get("complete", False),
+                "fallback_reason": result.get("fallback_reason"),
                 "note": "Machine transcript, not a verbatim quote.",
             },
             ensure_ascii=False,
             default=json_serializer,
         )
+    except ToolError:
+        raise
     except Exception as e:
         return log_and_format_error(
             "transcribe_voice", e, chat_id=chat_id, message_id=message_id, engine=engine
@@ -1739,26 +1823,50 @@ async def get_message_context(
     try:
         cl = get_client(account)
         chat = await resolve_entity(chat_id, cl)
-        # Get messages around the specified message
-        messages_before = await cl.get_messages(chat, limit=context_size, max_id=message_id)
+        numeric_chat_id = get_marked_id(chat)
+        if type(context_size) is not int or not 0 <= context_size <= 100:
+            raise ToolError("context_size must be between 0 and 100")
         central_message = await cl.get_messages(chat, ids=message_id)
-        # Fix: get_messages(ids=...) returns a single Message, not a list
-        if central_message is not None and not isinstance(central_message, list):
-            central_message = [central_message]
-        elif central_message is None:
-            central_message = []
-        messages_after = await cl.get_messages(
-            chat, limit=context_size, min_id=message_id, reverse=True
-        )
         if not central_message:
             return f"Message with ID {message_id} not found in chat {chat_id}."
-        # Combine messages in chronological order
-        all_messages = list(messages_before) + list(central_message) + list(messages_after)
-        all_messages.sort(key=lambda m: m.id)
-        numeric_chat_id = get_marked_id(chat)
+        if isinstance(central_message, list):
+            central_message = central_message[0]
+        if central_message.id != message_id or (
+            current_connection.get() is not None
+            and get_marked_id(getattr(central_message, "peer_id", None)) != numeric_chat_id
+        ):
+            raise ToolError("The requested context source is unavailable")
+        album_id = getattr(central_message, "grouped_id", None)
+        # Fetch an album's neighboring messages even when the caller requests no text context.
+        window = max(context_size, 11) if album_id else context_size
+        messages_before = (
+            list(await cl.get_messages(chat, limit=window, max_id=message_id)) if window else []
+        )
+        messages_after = (
+            list(await cl.get_messages(chat, limit=window, min_id=message_id, reverse=True))
+            if window
+            else []
+        )
+        selected = (
+            list(messages_before[:context_size])
+            + [central_message]
+            + list(messages_after[:context_size])
+        )
+        if album_id:
+            selected.extend(
+                msg
+                for msg in messages_before + messages_after
+                if getattr(msg, "grouped_id", None) == album_id
+            )
+        all_messages = sorted({msg.id: msg for msg in selected}.values(), key=lambda msg: msg.id)
         records = []
         forum = bool(getattr(chat, "forum", False))
         for msg in all_messages:
+            if (
+                current_connection.get() is not None
+                and get_marked_id(getattr(msg, "peer_id", None)) != numeric_chat_id
+            ):
+                raise ToolError("A context source is unavailable")
             record = message_to_dict(msg, numeric_chat_id, forum)
             record["is_target"] = msg.id == message_id
 
@@ -1767,6 +1875,12 @@ async def get_message_context(
                 try:
                     replied_msg = await cl.get_messages(chat, ids=replied_id)
                     if replied_msg:
+                        if replied_msg.id != replied_id or (
+                            current_connection.get() is not None
+                            and get_marked_id(getattr(replied_msg, "peer_id", None))
+                            != numeric_chat_id
+                        ):
+                            raise ToolError("A reply source is unavailable")
                         record["replied_message"] = message_to_dict(replied_msg, numeric_chat_id)
                 except Exception:
                     record["replied_message"] = None
@@ -1776,10 +1890,24 @@ async def get_message_context(
             "chat_id": chat_id,
             "target_message_id": message_id,
         }
+        if album_id:
+            metadata["album"] = {
+                "id": str(album_id),
+                "message_ids": [
+                    msg.id for msg in all_messages if getattr(msg, "grouped_id", None) == album_id
+                ],
+                "complete": all(
+                    len(side) < window or getattr(side[-1], "grouped_id", None) != album_id
+                    for side in (messages_before, messages_after)
+                ),
+                "coverage": "Bounded neighboring-message window; report incomplete coverage when an album reaches its edge.",
+            }
         topics = await topics_for_messages(cl, chat, all_messages)
         if topics:
             metadata["topics"] = topics
         return format_tool_result(records, metadata=metadata)
+    except ToolError:
+        raise
     except Exception as e:
         return log_and_format_error(
             "get_message_context",

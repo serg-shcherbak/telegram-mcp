@@ -1,14 +1,16 @@
 # Private Dot installation definition
 
-This is the direct-task installation definition under development. It has not passed
-image-build, Dot original-file acceptance, or release checks. Do not replace an existing
-service with it until those checks pass and deployment is authorized. Observation is off.
+This is the direct-task installation definition under development. Small synthetic
+original-file tasks passed in Dot; image-build and release checks remain outstanding.
+Do not replace an existing service until those checks pass and deployment is authorized.
+Observation is off.
 The server supplies permitted Telegram operations; Dot analyzes originals. A provisional
 `export_attachment` tool is available only when both read and attachment scopes permit
 the source. It returns at most 6,000,000 original bytes as a private MCP embedded resource;
-actual Dot materialization remains unverified. Follow the separate
-[synthetic acceptance procedure](../../docs/acceptance/dot-originals.md) before enabling it
-on personal sources. The new direct ASR interface is not exposed yet.
+small PNG, PDF, scan, DOCX, XLSX, WAV and MP4 originals were accepted in Dot. See the
+[synthetic acceptance evidence](../../docs/acceptance/dot-originals.md) for coverage and
+limits. Whole-post context preserves album/rich-media source identities and reports
+missing media, bounded coverage and long-text truncation explicitly.
 
 Use one existing own Telegram file session. Stop the process using that authorization
 before migration or startup; never run a second client with the same authorization key.
@@ -55,11 +57,25 @@ that operation. Send, attachment, and external ASR scopes are empty by default. 
 numeric IDs for this Dot profile. Dot must confirm the exact recipient, text, and reply
 target before every send. There is no separate server approval channel.
 
-Adding chats to `external_asr` is the owner's explicit opt-in for future direct OpenAI ASR
+Adding chats to `external_asr` is the owner's explicit opt-in for direct OpenAI ASR
 requests in those chats. Audio will leave Telegram and this installation for OpenAI, and
 API use can incur charges. An API key alone is not consent. Reading history and background
-events do not grant or trigger external ASR. The new direct ASR tool is not yet exposed;
-this example keeps transcription off and includes no API key. Remove scopes to revoke
+events do not grant or trigger external ASR. `transcribe_voice` also accepts ordinary
+audio, requires both read and external-ASR scope, and uses the official OpenAI endpoint
+with `gpt-transcribe` by default. Attachment-export rights remain separate. Voice/video
+notes can fall back to native Telegram when the primary provider is unavailable;
+ordinary audio cannot. Results identify the actual engine, fallback and completeness.
+Authentication/configuration/size failures and uncertain paid requests are explicit;
+uncertain requests are not retried automatically. Live external ASR was not run in the
+synthetic verification. Large-recording processing remains under implementation.
+
+Transcript cache identity includes account, source version, provider/model and material
+options. Its default validity is seven days. `TELEGRAM_TRANSCRIPT_RETENTION_SECONDS=0`
+disables storage; expired text is deleted on the next cache access rather than by a
+background purge timer. The cache is plaintext in a private directory outside media
+roots. Keep its files out of artifacts and backups that are shared with others.
+
+The example includes no provider API key and grants no ASR scope. Remove scopes to revoke
 permission; remove or replace a profile token to revoke its client. Current token/scope
 changes are reread, while owner/media-root changes require a restart. Revoke a compromised
 Telegram authorization in Telegram Settings > Devices.

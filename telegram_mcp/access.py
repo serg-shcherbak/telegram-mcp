@@ -165,7 +165,7 @@ def effective_chat_scope(legacy):
 
 def _operation_scope(profile, operation):
     scope = getattr(profile, operation)
-    if operation == "attachments" and profile.read is not None:
+    if operation in {"attachments", "external_asr"} and profile.read is not None:
         return profile.read if scope is None else scope.intersection(profile.read)
     return scope
 
@@ -213,11 +213,29 @@ class BackendAuthMiddleware:
             current_connection.reset(context_token)
 
 
-READ_TOOLS = frozenset({"get_chats", "get_messages", "search_messages", "list_chats"})
+READ_TOOLS = frozenset(
+    {
+        "get_chats",
+        "get_messages",
+        "search_messages",
+        "list_chats",
+        "list_messages",
+        "get_message_context",
+    }
+)
 TOOL_OPERATIONS = {name: "read" for name in READ_TOOLS} | {
     "send_message": "send",
     "export_attachment": "attachments",
+    "transcribe_voice": "external_asr",
 }
+ASR_DESCRIPTION = (
+    "Transcribe requested voice, video note, or ordinary audio using official OpenAI "
+    "after the owner's setup opt-in for this source. Only engine=openai is permitted; "
+    "native Telegram fallback is automatic only for supported voice/video notes. "
+    "History never starts ASR. Results identify the engine, fallback and coverage. "
+    "Transcript text is retained for 7 days by default; "
+    "TELEGRAM_TRANSCRIPT_RETENTION_SECONDS changes expiry (0 disables retention)."
+)
 SEND_DESCRIPTION = (
     "Send only after Dot obtains confirmation of the exact recipient, full text, and reply "
     "target for this call. Cancellation means no send. Never retry an unknown send result "
@@ -234,7 +252,7 @@ class DotMCP(FastMCP):
         self._dot_owner_id = config.owner_id
         self._dot_media_root = config.media_root
         super().__init__("telegram-dot", stateless_http=True, json_response=True)
-        for name in sorted(READ_TOOLS | {"send_message"}):
+        for name in sorted(READ_TOOLS | {"send_message", "transcribe_voice"}):
             tool = source._tool_manager.get_tool(name)
             if tool is None:
                 raise ValueError("A reviewed core tool is missing")
@@ -253,7 +271,7 @@ class DotMCP(FastMCP):
                         "caps Telegram dialogs before filtering unread/type/archive. with_about "
                         "requires an explicit positive limit at most 100. " + tool.description
                         if name == "list_chats"
-                        else tool.description
+                        else ASR_DESCRIPTION if name == "transcribe_voice" else tool.description
                     )
                 ),
                 annotations=(
@@ -356,6 +374,10 @@ class DotMCP(FastMCP):
             raise ToolError("Invalid source identifier")
         if arguments.get("account") not in (None, "default"):
             raise AccessDenied("Account is not permitted")
+        if name in {"transcribe_voice", "get_message_context"} and (
+            type(arguments.get("message_id")) is not int or not 0 < arguments["message_id"] < 2**31
+        ):
+            raise ToolError("Invalid source identifier")
         if name == "export_attachment" and (
             not isinstance(arguments.get("chat_id"), (int, str))
             or type(arguments.get("message_id")) is not int

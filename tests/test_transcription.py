@@ -146,7 +146,7 @@ def test_legacy_cache_keyed_without_engine_is_migrated_in_place(transcript_cache
             created_at TEXT NOT NULL,
             PRIMARY KEY (chat_id, message_id)
         );
-        INSERT INTO transcripts VALUES (1, 2, 'telegram', 'old row', 23, 'ru', '2026-08-20');
+        INSERT INTO transcripts VALUES (1, 2, 'telegram', 'old row', 23, 'ru', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'));
         """)
     conn.commit()
     conn.close()
@@ -177,6 +177,49 @@ def test_is_transcribable_true_for_voice():
 
 def test_is_transcribable_true_for_video_note():
     assert transcription.is_transcribable(_voice_msg(voice=None, video_note=SimpleNamespace()))
+
+
+def test_is_transcribable_true_for_ordinary_audio():
+    assert transcription.is_transcribable(_voice_msg(voice=None, audio=SimpleNamespace()))
+
+
+@pytest.mark.asyncio
+async def test_native_ordinary_audio_is_rejected_without_rpc(monkeypatch):
+    async def forbidden(*args):
+        raise AssertionError("Native ASR must not receive an ordinary audio file")
+
+    monkeypatch.setattr(transcription, "account_is_premium", forbidden)
+    result = await transcription.transcribe(
+        None, None, _voice_msg(voice=None, audio=SimpleNamespace()), "telegram"
+    )
+    assert result["reason"] == "native_unsupported_media"
+
+
+@pytest.mark.asyncio
+async def test_transcript_cache_identity_separates_account_and_attachment(
+    transcript_cache_dir, monkeypatch
+):
+    counter = {"calls": 0}
+    monkeypatch.setattr(transcription, "transcribe", _counting_engine(counter))
+    msg = _voice_msg(id=81, document=SimpleNamespace(id=91))
+    first_client = SimpleNamespace(_mb_entity_cache=SimpleNamespace(self_id=10))
+    second_client = SimpleNamespace(_mb_entity_cache=SimpleNamespace(self_id=20))
+    await transcription.transcribe_cached(first_client, None, msg, "groq", -100)
+    await transcription.transcribe_cached(second_client, None, msg, "groq", -100)
+    msg.document.id = 92
+    await transcription.transcribe_cached(second_client, None, msg, "groq", -100)
+    assert counter["calls"] == 3
+
+
+@pytest.mark.asyncio
+async def test_zero_retention_never_stores_text(transcript_cache_dir, monkeypatch):
+    monkeypatch.setenv("TELEGRAM_TRANSCRIPT_RETENTION_SECONDS", "0")
+    counter = {"calls": 0}
+    monkeypatch.setattr(transcription, "transcribe", _counting_engine(counter))
+    for _ in range(2):
+        await transcription.transcribe_cached(None, None, _voice_msg(), "groq", 1)
+    assert counter["calls"] == 2
+    assert transcription.get_cached_transcript(1, 1) is None
 
 
 def test_is_transcribable_false_for_plain_message():
@@ -261,7 +304,14 @@ def test_voice_attachment_info_disabled_when_mode_off(monkeypatch, transcript_ca
 
 def test_voice_attachment_info_cache_hit_is_ready(monkeypatch, transcript_cache_dir):
     monkeypatch.setenv("TELEGRAM_TRANSCRIBE", "on-demand")
-    transcription.save_transcript(1, 1, "groq", "hello", duration=23)
+    transcription.save_transcript(
+        1,
+        1,
+        "groq",
+        "hello",
+        duration=23,
+        identity=transcription.transcript_identity(_voice_msg(id=1), 1, "groq"),
+    )
     info = transcription.voice_attachment_info(_voice_msg(id=1), chat_id=1)
     assert info["transcript_status"] == "ready"
     assert info["transcript"] == "hello"
@@ -341,7 +391,7 @@ async def test_transcribe_via_telegram_polls_until_ready(monkeypatch):
         ]
     )
 
-    result = await transcription._transcribe_via_telegram(client, object(), SimpleNamespace(id=42))
+    result = await transcription._transcribe_via_telegram(client, object(), _voice_msg(id=42))
 
     assert result == {"status": "ok", "text": "full text, no dropped tail"}
     assert client.calls == 3  # 1 initial + 2 polls, matches the live 83s-recording measurement
@@ -353,7 +403,7 @@ async def test_transcribe_via_telegram_first_call_ready_needs_no_poll(monkeypatc
     monkeypatch.setattr(transcription.asyncio, "sleep", _async_return(None))
     client = _FakeTelegramClient([SimpleNamespace(pending=False, text="instant")])
 
-    result = await transcription._transcribe_via_telegram(client, object(), SimpleNamespace(id=1))
+    result = await transcription._transcribe_via_telegram(client, object(), _voice_msg(id=1))
 
     assert result == {"status": "ok", "text": "instant"}
     assert client.calls == 1
@@ -366,7 +416,7 @@ async def test_transcribe_via_telegram_gives_up_after_poll_budget_and_degrades(m
     monkeypatch.setattr(transcription, "_POLL_ATTEMPTS", 2)
     client = _FakeTelegramClient([SimpleNamespace(pending=True, text=None)] * 10)
 
-    result = await transcription._transcribe_via_telegram(client, object(), SimpleNamespace(id=1))
+    result = await transcription._transcribe_via_telegram(client, object(), _voice_msg(id=1))
 
     assert result == {"status": "pending"}  # honest degradation, not a crash
 
@@ -376,7 +426,7 @@ async def test_transcribe_via_telegram_requires_premium(monkeypatch):
     monkeypatch.setattr(transcription, "account_is_premium", _async_return(False))
     client = _FakeTelegramClient([])
 
-    result = await transcription._transcribe_via_telegram(client, object(), SimpleNamespace(id=1))
+    result = await transcription._transcribe_via_telegram(client, object(), _voice_msg(id=1))
 
     assert result == {"status": "premium_required"}
     assert client.calls == 0  # never even attempted the RPC
@@ -388,7 +438,7 @@ async def test_transcribe_via_telegram_rpc_error_maps_to_premium_required(monkey
     monkeypatch.setattr(transcription, "is_premium_rpc_error", lambda e: True)
     client = _FakeTelegramClient([RuntimeError("PREMIUM_ACCOUNT_REQUIRED")])
 
-    result = await transcription._transcribe_via_telegram(client, object(), SimpleNamespace(id=1))
+    result = await transcription._transcribe_via_telegram(client, object(), _voice_msg(id=1))
 
     assert result == {"status": "premium_required"}
 
@@ -606,7 +656,13 @@ async def test_prefetch_skips_cached_and_already_texted_messages(
     monkeypatch, transcript_cache_dir
 ):
     monkeypatch.setenv("TELEGRAM_TRANSCRIBE", "auto")
-    transcription.save_transcript(7, 1, "telegram", "already have it")
+    transcription.save_transcript(
+        7,
+        1,
+        "groq",
+        "already have it",
+        identity=transcription.transcript_identity(_voice_msg(id=1), 7, "groq"),
+    )
     calls = []
 
     async def _fake_transcribe(cl, entity, msg, engine):
@@ -954,7 +1010,12 @@ async def test_openai_compatible_http_failure_is_error(monkeypatch):
 
     class _Boom:
         def raise_for_status(self):
-            raise RuntimeError("500 Internal Server Error")
+            import httpx
+
+            response = httpx.Response(
+                500, request=httpx.Request("POST", "https://synthetic.invalid")
+            )
+            response.raise_for_status()
 
     monkeypatch.setattr(
         transcription.httpx, "AsyncClient", lambda **kw: _FakeHttpxClient(_Boom(), [])
@@ -963,7 +1024,8 @@ async def test_openai_compatible_http_failure_is_error(monkeypatch):
     result = await transcription.transcribe(_bytes_client(), None, _voice_msg(), "openai")
 
     assert result["status"] == "error"
-    assert "openai request failed" in result["error"]
+    assert result["reason"] == "provider_unavailable"
+    assert result["error"] == "openai returned HTTP 500."
 
 
 def test_engine_config_error(monkeypatch):
@@ -1058,7 +1120,8 @@ async def test_whisper_inference_failure_is_error(monkeypatch, fake_whisper):
     result = await transcription.transcribe(_bytes_client(), None, _voice_msg(), "whisper")
 
     assert result["status"] == "error"
-    assert "bad audio" in result["error"]
+    assert result["error"] == "Local whisper transcription failed."
+    assert "bad audio" not in result["error"]
 
 
 def test_default_cache_falls_back_to_a_user_cache_when_cwd_is_unusable(tmp_path, monkeypatch):

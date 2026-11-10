@@ -29,8 +29,12 @@ alongside ``text`` rather than presenting it as exact speech.
 import asyncio
 import importlib.util
 import io
+import hashlib
+import json
+import math
 import os
 import sqlite3
+import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -41,6 +45,7 @@ import httpx
 from telethon.tl import functions
 
 from telegram_mcp.runtime import account_is_premium, get_marked_id, is_premium_rpc_error
+from telegram_mcp.access import AccessDenied, current_connection, current_operation
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -53,6 +58,7 @@ GROQ_TRANSCRIBE_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 GROQ_MODEL = "whisper-large-v3-turbo"
 
 OPENAI_DEFAULT_MODEL = "whisper-1"
+OPENAI_TRANSCRIBE_URL = "https://api.openai.com/v1/audio/transcriptions"
 
 WHISPER_DEFAULT_MODEL = "small"
 
@@ -179,12 +185,21 @@ def http_engine_config(engine: str) -> Optional[HttpEngineConfig]:
             url=_endpoint(base) if base else None,
             api_key=os.getenv("TELEGRAM_TRANSCRIBE_OPENAI_API_KEY") or None,
             model=os.getenv("TELEGRAM_TRANSCRIBE_OPENAI_MODEL", "").strip()
-            or OPENAI_DEFAULT_MODEL,
+            or (
+                "gpt-transcribe" if current_connection.get() is not None else OPENAI_DEFAULT_MODEL
+            ),
             # "json" is the one format every compatible server and every
             # OpenAI model (gpt-4o-transcribe included) accepts; verbose_json
             # is whisper-only.
             response_format="json",
-            max_bytes=int(_env_float("TELEGRAM_TRANSCRIBE_OPENAI_MAX_MB", 25.0) * 1048576),
+            max_bytes=(
+                min(
+                    24_000_000,
+                    int(_env_float("TELEGRAM_TRANSCRIBE_OPENAI_MAX_MB", 25.0) * 1048576),
+                )
+                if current_connection.get() is not None
+                else int(_env_float("TELEGRAM_TRANSCRIBE_OPENAI_MAX_MB", 25.0) * 1048576)
+            ),
             max_mb_env="TELEGRAM_TRANSCRIBE_OPENAI_MAX_MB",
             timeout=_http_timeout(),
         )
@@ -200,6 +215,12 @@ def engine_config_error(engine: str) -> Optional[str]:
 
     Checked before any download, so a misconfigured engine costs nothing.
     """
+    if current_connection.get() is not None:
+        cfg = http_engine_config(engine)
+        if engine != "openai" or cfg is None or cfg.url != OPENAI_TRANSCRIBE_URL:
+            return "Dot ASR requires the official OpenAI transcription endpoint."
+        if not cfg.api_key:
+            return "TELEGRAM_TRANSCRIBE_OPENAI_API_KEY is not configured."
     if engine == "groq" and not os.getenv("GROQ_API_KEY"):
         return (
             "GROQ_API_KEY is not configured on this server. "
@@ -255,6 +276,84 @@ def _too_large(size: int, limit: int, cfg: HttpEngineConfig) -> dict:
 DEFAULT_CACHE_DIR = "data/transcripts"
 
 
+def retention_seconds() -> float:
+    """Plaintext transcript retention: seven days; zero disables storage and purges on access."""
+    try:
+        value = float(os.getenv("TELEGRAM_TRANSCRIPT_RETENTION_SECONDS", "604800"))
+    except ValueError:
+        value = -1
+    if not math.isfinite(value) or value < 0:
+        raise ValueError("Invalid transcript retention setting")
+    return value
+
+
+def check_transcript_access(chat_id: int, *, operation=False) -> None:
+    connection = current_connection.get()
+    if connection is None:
+        return
+    profile = connection.revalidate()
+    if operation and current_operation.get() != "external_asr":
+        raise AccessDenied("An explicit transcription operation is required")
+    if any(
+        scope is not None and chat_id not in scope
+        for scope in (profile.read, profile.external_asr)
+    ):
+        raise AccessDenied("Read and external ASR permission are required for this source")
+    from telegram_mcp.runtime import check_chat_access
+
+    if check_chat_access(chat_id):
+        raise AccessDenied("Transcription source is not permitted")
+
+
+def transcript_identity(msg, chat_id: int, engine: str, cl=None) -> str:
+    """Identity comes only from the fetched source and server-owned provider settings."""
+    from telegram_mcp.runtime import clients
+
+    connection = current_connection.get()
+    cl = cl or getattr(msg, "_client", None)
+    account_id = getattr(getattr(cl, "_mb_entity_cache", None), "self_id", None)
+    account = account_id or next(
+        (name for name, client in clients.items() if client is cl), "default"
+    )
+    document = getattr(msg, "document", None)
+    file = getattr(msg, "file", None)
+    cfg = http_engine_config(engine)
+    material = {
+        "account": account,
+        "owner": connection.config.owner_id if connection is not None else None,
+        "peer": chat_id,
+        "message": msg.id,
+        "attachment": getattr(document, "id", None),
+        "size": getattr(file, "size", None),
+        "mime": getattr(file, "mime_type", None),
+        "duration": voice_duration(msg),
+        "edited": str(getattr(msg, "edit_date", None)),
+        "engine": engine,
+        "provider": cfg.url if cfg else engine,
+        "model": cfg.model if cfg else _whisper_settings() if engine == "whisper" else None,
+        "format": cfg.response_format if cfg else None,
+        "language": transcribe_language(),
+    }
+    return hashlib.sha256(
+        json.dumps(material, sort_keys=True, ensure_ascii=False).encode()
+    ).hexdigest()
+
+
+async def _revalidate_audio_source(cl, entity, chat_id, message_id, engine, identity):
+    if current_connection.get() is None:
+        return
+    check_transcript_access(chat_id, operation=True)
+    current = await cl.get_messages(entity, ids=message_id)
+    if (
+        not current
+        or current.id != message_id
+        or get_marked_id(current.peer_id) != chat_id
+        or transcript_identity(current, chat_id, engine, cl) != identity
+    ):
+        raise AccessDenied("Audio source changed during transcription; result withheld")
+    check_transcript_access(chat_id, operation=True)
+
+
 def cache_dir() -> Path:
     raw = os.getenv("TELEGRAM_TRANSCRIPT_CACHE_DIR")
     if raw:
@@ -285,6 +384,7 @@ def _cache_db_path() -> Path:
 def _connect() -> sqlite3.Connection:
     path = _cache_db_path()
     conn = sqlite3.connect(str(path))
+    conn.execute("PRAGMA secure_delete = ON")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS transcripts (
             chat_id INTEGER NOT NULL,
@@ -294,10 +394,19 @@ def _connect() -> sqlite3.Connection:
             duration INTEGER,
             lang TEXT,
             created_at TEXT NOT NULL,
-            PRIMARY KEY (chat_id, message_id, source)
+            identity TEXT NOT NULL DEFAULT '',
+            expires_at REAL NOT NULL,
+            PRIMARY KEY (chat_id, message_id, source, identity)
         )
         """)
     _migrate_source_into_key(conn)
+    conn.execute(
+        "UPDATE transcripts SET expires_at = MIN(expires_at, COALESCE(unixepoch(created_at), 0) + ?)",
+        (retention_seconds(),),
+    )
+    conn.execute("DELETE FROM transcripts WHERE expires_at <= ?", (time.time(),))
+    if retention_seconds() == 0:
+        conn.execute("DELETE FROM transcripts")
     conn.commit()
     try:
         os.chmod(path, 0o600)
@@ -315,9 +424,10 @@ def _migrate_source_into_key(conn: sqlite3.Connection) -> None:
     ).fetchone()
     if not row or not row[0]:
         return
-    if "PRIMARY KEY (chat_id, message_id, source)" in row[0]:
+    if "PRIMARY KEY (chat_id, message_id, source, identity)" in row[0]:
         return
     conn.executescript("""
+        BEGIN IMMEDIATE;
         ALTER TABLE transcripts RENAME TO transcripts_legacy;
         CREATE TABLE transcripts (
             chat_id INTEGER NOT NULL,
@@ -327,18 +437,22 @@ def _migrate_source_into_key(conn: sqlite3.Connection) -> None:
             duration INTEGER,
             lang TEXT,
             created_at TEXT NOT NULL,
-            PRIMARY KEY (chat_id, message_id, source)
+            identity TEXT NOT NULL DEFAULT '',
+            expires_at REAL NOT NULL,
+            PRIMARY KEY (chat_id, message_id, source, identity)
         );
         INSERT OR IGNORE INTO transcripts
-            (chat_id, message_id, source, text, duration, lang, created_at)
-        SELECT chat_id, message_id, source, text, duration, lang, created_at
+            (chat_id, message_id, source, text, duration, lang, created_at, expires_at)
+        SELECT chat_id, message_id, source, text, duration, lang, created_at,
+            COALESCE(unixepoch(created_at), 0) + 604800
         FROM transcripts_legacy;
         DROP TABLE transcripts_legacy;
+        COMMIT;
         """)
 
 
 def get_cached_transcript(
-    chat_id: int, message_id: int, source: Optional[str] = None
+    chat_id: int, message_id: int, source: Optional[str] = None, *, identity: Optional[str] = None
 ) -> Optional[dict]:
     """Cached transcript for a message.
 
@@ -348,25 +462,33 @@ def get_cached_transcript(
     display whatever exists (listings, backfill skip checks) pass None and get
     the default engine's row when there is one, any row otherwise.
     """
+    check_transcript_access(chat_id)
+    if current_connection.get() is not None and identity is None:
+        raise AccessDenied("A fresh source identity is required for cached transcripts")
     conn = _connect()
     try:
+        identity_clause = " AND identity = ?" if identity is not None else ""
+        parameters = (identity,) if identity is not None else ()
         if source is not None:
             row = conn.execute(
                 "SELECT source, text, duration, lang, created_at FROM transcripts "
-                "WHERE chat_id = ? AND message_id = ? AND source = ?",
-                (chat_id, message_id, source),
+                "WHERE chat_id = ? AND message_id = ? AND source = ?"
+                + identity_clause
+                + " ORDER BY created_at DESC LIMIT 1",
+                (chat_id, message_id, source) + parameters,
             ).fetchone()
         else:
             row = conn.execute(
                 "SELECT source, text, duration, lang, created_at FROM transcripts "
-                "WHERE chat_id = ? AND message_id = ? "
+                "WHERE chat_id = ? AND message_id = ?" + identity_clause + " "
                 "ORDER BY source = ? DESC, created_at DESC LIMIT 1",
-                (chat_id, message_id, default_engine()),
+                (chat_id, message_id) + parameters + (default_engine(),),
             ).fetchone()
     finally:
         conn.close()
     if row is None:
         return None
+    check_transcript_access(chat_id)
     source, text, duration, lang, created_at = row
     return {
         "source": source,
@@ -385,13 +507,18 @@ def save_transcript(
     *,
     duration: Optional[int] = None,
     lang: Optional[str] = None,
+    identity: str = "",
 ) -> None:
+    check_transcript_access(chat_id)
     conn = _connect()
     try:
+        ttl = retention_seconds()
+        if ttl == 0:
+            return
         conn.execute(
             "INSERT OR REPLACE INTO transcripts "
-            "(chat_id, message_id, source, text, duration, lang, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "(chat_id, message_id, source, text, duration, lang, created_at, identity, expires_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 chat_id,
                 message_id,
@@ -400,6 +527,8 @@ def save_transcript(
                 duration,
                 lang,
                 datetime.now(timezone.utc).isoformat(),
+                identity,
+                time.time() + ttl,
             ),
         )
         conn.commit()
@@ -413,9 +542,8 @@ def save_transcript(
 
 
 def is_transcribable(msg) -> bool:
-    """True for voice notes and video notes (video circles) - both go through
-    the same engine path."""
-    return getattr(msg, "voice", None) is not None or getattr(msg, "video_note", None) is not None
+    """Voice notes, video circles and ordinary audio use the same engine path."""
+    return any(getattr(msg, name, None) is not None for name in ("voice", "video_note", "audio"))
 
 
 def voice_duration(msg) -> Optional[int]:
@@ -450,24 +578,46 @@ async def _transcribe_via_telegram(cl, entity, msg) -> dict:
     """Native Premium transcription. Polls while pending=True - proven live on
     2026-08-20: an 83s recording matured after 3 polls (~6.6s); without
     polling, long voice messages come back empty."""
+    if getattr(msg, "voice", None) is None and getattr(msg, "video_note", None) is None:
+        return {
+            "status": "error",
+            "reason": "native_unsupported_media",
+            "error": "Native Telegram ASR supports only voice and video notes.",
+        }
+    if current_connection.get() is not None:
+        check_transcript_access(get_marked_id(msg.peer_id), operation=True)
     if not await account_is_premium(cl):
         return {"status": "premium_required"}
     peer = await cl.get_input_entity(entity)
+    if current_connection.get() is not None:
+        check_transcript_access(get_marked_id(msg.peer_id), operation=True)
     try:
         result = await cl(functions.messages.TranscribeAudioRequest(peer=peer, msg_id=msg.id))
     except Exception as e:
         if is_premium_rpc_error(e):
             return {"status": "premium_required"}
-        return {"status": "error", "error": str(e)}
+        return {
+            "status": "error",
+            "reason": "native_failed",
+            "error": "Native Telegram transcription failed.",
+        }
 
     attempts = 0
     while getattr(result, "pending", False) and attempts < _POLL_ATTEMPTS:
         await asyncio.sleep(_POLL_INTERVAL_SECONDS)
         attempts += 1
         try:
+            if current_connection.get() is not None:
+                check_transcript_access(get_marked_id(msg.peer_id), operation=True)
             result = await cl(functions.messages.TranscribeAudioRequest(peer=peer, msg_id=msg.id))
-        except Exception as e:
-            return {"status": "error", "error": str(e)}
+        except AccessDenied:
+            raise
+        except Exception:
+            return {
+                "status": "error",
+                "reason": "native_failed",
+                "error": "Native Telegram transcription polling failed.",
+            }
 
     if getattr(result, "pending", False):
         return {"status": "pending"}
@@ -481,15 +631,24 @@ async def _download_audio(cl, msg, limit: Optional[int], cfg=None):
     oversized recording is refused before it is downloaded when Telegram
     states the size up front, and again after the download when it did not.
     """
+    connection = current_connection.get()
+    if connection is not None:
+        check_transcript_access(get_marked_id(msg.peer_id), operation=True)
     declared = getattr(getattr(msg, "file", None), "size", None)
     if limit is not None and isinstance(declared, int) and declared > limit:
         return None, _too_large(declared, limit, cfg)
     try:
         data = await cl.download_media(msg, file=bytes)
-    except Exception as e:
-        return None, {"status": "error", "error": f"download failed: {e}"}
+    except Exception:
+        return None, {
+            "status": "error",
+            "reason": "download_failed",
+            "error": "Audio download failed.",
+        }
     if not data:
         return None, {"status": "error", "error": "empty media download"}
+    if connection is not None:
+        check_transcript_access(get_marked_id(msg.peer_id), operation=True)
     # The declared size can be missing or stale; the bytes in hand cannot.
     if limit is not None and len(data) > limit:
         size = len(data)
@@ -509,12 +668,19 @@ def _upload_name(msg) -> tuple:
     return f"voice.{ext}", mime
 
 
-async def _transcribe_via_openai_compatible(cl, msg, cfg: HttpEngineConfig) -> dict:
+async def _transcribe_via_openai_compatible(
+    cl, msg, cfg: HttpEngineConfig, *, entity=None
+) -> dict:
     """POST the recording to an OpenAI-style ``/audio/transcriptions``
     endpoint (groq, openai). Deletes the bytes as soon as the
     request returns."""
     if not cfg.url:
         return {"status": "error", "error": engine_config_error(cfg.engine)}
+
+    source = None
+    if current_connection.get() is not None:
+        peer_id, message_id = get_marked_id(msg.peer_id), msg.id
+        source = transcript_identity(msg, peer_id, cfg.engine, cl)
 
     data, error = await _download_audio(cl, msg, cfg.max_bytes, cfg)
     if error is not None:
@@ -528,6 +694,15 @@ async def _transcribe_via_openai_compatible(cl, msg, cfg: HttpEngineConfig) -> d
     headers = {"Authorization": f"Bearer {cfg.api_key}"} if cfg.api_key else {}
 
     try:
+        if current_connection.get() is not None:
+            await _revalidate_audio_source(
+                cl,
+                entity if entity is not None else msg.peer_id,
+                peer_id,
+                message_id,
+                cfg.engine,
+                source,
+            )
         async with httpx.AsyncClient(timeout=cfg.timeout) as client:
             resp = await client.post(
                 cfg.url,
@@ -537,8 +712,36 @@ async def _transcribe_via_openai_compatible(cl, msg, cfg: HttpEngineConfig) -> d
             )
         resp.raise_for_status()
         payload = resp.json()
-    except Exception as e:
-        return {"status": "error", "error": f"{cfg.engine} request failed: {e}"}
+    except httpx.HTTPStatusError as error:
+        status = error.response.status_code
+        reason = (
+            "provider_credentials"
+            if status in (401, 403)
+            else (
+                "provider_unavailable"
+                if status == 429 or status >= 500
+                else "too_large" if status == 413 else "provider_rejected"
+            )
+        )
+        return {
+            "status": "error",
+            "reason": reason,
+            "error": f"{cfg.engine} returned HTTP {status}.",
+        }
+    except httpx.ConnectError:
+        return {
+            "status": "error",
+            "reason": "provider_unavailable",
+            "error": "ASR provider connection failed.",
+        }
+    except AccessDenied:
+        raise
+    except Exception:
+        return {
+            "status": "error",
+            "reason": "provider_outcome_unknown",
+            "error": "ASR request outcome is unknown. Do not retry automatically.",
+        }
     finally:
         del data
 
@@ -613,8 +816,8 @@ async def _transcribe_via_whisper(cl, msg) -> dict:
             text, lang = await asyncio.to_thread(
                 _run_whisper, bytes(data), _whisper_settings(), language
             )
-    except Exception as e:
-        return {"status": "error", "error": f"whisper failed: {e}"}
+    except Exception:
+        return {"status": "error", "error": "Local whisper transcription failed."}
     finally:
         del data
 
@@ -629,6 +832,39 @@ async def transcribe(cl, entity, msg, engine: str) -> dict:
     {"status": "pending"} | {"status": "premium_required"} |
     {"status": "error", "error": ...}
     """
+    if current_connection.get() is not None:
+        check_transcript_access(get_marked_id(msg.peer_id), operation=True)
+        if engine != "openai":
+            raise AccessDenied("Dot ASR uses official OpenAI; engine override is not permitted")
+        error = engine_config_error(engine)
+        if error:
+            return {"status": "error", "reason": "provider_configuration", "error": error}
+        result = await _transcribe_via_openai_compatible(
+            cl, msg, http_engine_config(engine), entity=entity
+        )
+        check_transcript_access(get_marked_id(msg.peer_id), operation=True)
+        if result.get("reason") != "provider_unavailable":
+            return dict(
+                result,
+                source="openai",
+                complete=result.get("status") == "ok",
+                fallback_reason=None,
+            )
+        if getattr(msg, "voice", None) is None and getattr(msg, "video_note", None) is None:
+            return dict(
+                result,
+                reason="native_unsupported_media",
+                fallback_reason="provider_unavailable",
+                complete=False,
+            )
+        fallback = await _transcribe_via_telegram(cl, entity, msg)
+        check_transcript_access(get_marked_id(msg.peer_id), operation=True)
+        return dict(
+            fallback,
+            source="telegram",
+            fallback_reason="provider_unavailable",
+            complete=fallback.get("status") == "ok",
+        )
     if engine == "telegram":
         return await _transcribe_via_telegram(cl, entity, msg)
     if engine == "groq":
@@ -685,6 +921,8 @@ def _cached_result(row: dict) -> dict:
         "lang": row.get("lang"),
         "duration": row.get("duration"),
         "source": row.get("source"),
+        "complete": True,
+        "fallback_reason": None,
     }
 
 
@@ -697,21 +935,38 @@ async def transcribe_cached(
     would otherwise write to the transcript cache should go through here.
     """
     message_id = getattr(msg, "id", None)
-    hit = get_cached_transcript(chat_id, message_id, source=engine)
+    check_transcript_access(chat_id, operation=True)
+    if current_connection.get() is not None and engine != "openai":
+        raise AccessDenied("Dot ASR uses official OpenAI; engine override is not permitted")
+    peer = getattr(msg, "peer_id", None)
+    if peer is not None and get_marked_id(peer) != chat_id:
+        raise AccessDenied("The requested transcription source changed")
+    if current_connection.get() is not None and (
+        peer is None or getattr(getattr(msg, "document", None), "id", None) is None
+    ):
+        raise AccessDenied("The audio has no stable source identity")
+    identity = transcript_identity(msg, chat_id, engine, cl)
+
+    await _revalidate_audio_source(cl, entity, chat_id, message_id, engine, identity)
+    hit = get_cached_transcript(chat_id, message_id, source=engine, identity=identity)
     if hit is not None:
         return _cached_result(hit)
 
-    async with _transcribe_lock((chat_id, message_id, engine)):
+    async with _transcribe_lock((chat_id, message_id, engine, identity)):
         # Re-read: a concurrent caller may have paid for this one while we
         # were waiting for the lock.
-        hit = get_cached_transcript(chat_id, message_id, source=engine)
+        check_transcript_access(chat_id, operation=True)
+        await _revalidate_audio_source(cl, entity, chat_id, message_id, engine, identity)
+        hit = get_cached_transcript(chat_id, message_id, source=engine, identity=identity)
         if hit is not None:
             return _cached_result(hit)
 
         if duration is None:
             duration = voice_duration(msg)
         result = await transcribe(cl, entity, msg, engine)
-        if result.get("status") == "ok":
+        check_transcript_access(chat_id, operation=True)
+        await _revalidate_audio_source(cl, entity, chat_id, message_id, engine, identity)
+        if result.get("status") == "ok" and result.get("source", engine) == engine:
             save_transcript(
                 chat_id,
                 message_id,
@@ -719,11 +974,14 @@ async def transcribe_cached(
                 result["text"],
                 duration=duration,
                 lang=result.get("lang"),
+                identity=identity,
             )
         out = dict(result)
         out["cached"] = False
         out.setdefault("duration", duration)
         out.setdefault("source", engine)
+        out.setdefault("complete", result.get("status") == "ok")
+        out.setdefault("fallback_reason", None)
         return out
 
 
@@ -782,7 +1040,7 @@ async def prefetch_transcripts(cl, entity, chat_id: int, messages) -> None:
     misses to render as "transcript pending" - callers must invoke
     transcribe_voice explicitly to pay for them.
     """
-    if transcribe_mode() != "auto":
+    if current_connection.get() is not None or transcribe_mode() != "auto":
         return
     budget = TranscribeBudget()
     engine = default_engine()
@@ -791,7 +1049,15 @@ async def prefetch_transcripts(cl, entity, chat_id: int, messages) -> None:
             continue
         if getattr(msg, "message", None):
             continue  # already has text, nothing to fill
-        if get_cached_transcript(chat_id, msg.id) is not None:
+        if (
+            get_cached_transcript(
+                chat_id,
+                msg.id,
+                source=engine,
+                identity=transcript_identity(msg, chat_id, engine, cl),
+            )
+            is not None
+        ):
             continue
         duration = voice_duration(msg)
         if not budget.can_afford(duration):
@@ -833,7 +1099,22 @@ def voice_attachment_info(msg, chat_id: Optional[int]) -> Optional[dict]:
     }
     if chat_id is None or transcribe_mode() == "off":
         return info
-    cached = get_cached_transcript(chat_id, msg.id)
+    try:
+        check_transcript_access(chat_id)
+    except AccessDenied:
+        return info
+    engines = (
+        ["openai"]
+        if current_connection.get() is not None
+        else [default_engine()] + sorted(ENGINES - {default_engine()})
+    )
+    cached = None
+    for engine in engines:
+        cached = get_cached_transcript(
+            chat_id, msg.id, source=engine, identity=transcript_identity(msg, chat_id, engine)
+        )
+        if cached is not None:
+            break
     if cached is not None:
         info["transcript"] = cached["text"]
         info["transcript_source"] = cached["source"]
