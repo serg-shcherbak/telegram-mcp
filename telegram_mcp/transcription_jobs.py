@@ -1,6 +1,5 @@
-"""One private long-audio job, polled through the existing transcription tool."""
-
 import asyncio
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -51,6 +50,7 @@ def _without_text(state):
     return state
 
 
+@contextmanager
 def _connect():
     from telegram_mcp import transcription as audio
 
@@ -58,24 +58,27 @@ def _connect():
     descriptor = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
     os.close(descriptor)
     connection = sqlite3.connect(path)
-    connection.execute("PRAGMA secure_delete=ON")
-    connection.execute(
-        "CREATE TABLE IF NOT EXISTS jobs (key TEXT PRIMARY KEY, payload TEXT NOT NULL, created REAL NOT NULL)"
-    )
-    retention = audio.retention_seconds()
-    for key, payload, created in connection.execute(
-        "SELECT key,payload,created FROM jobs"
-    ).fetchall():
-        if retention == 0 or created + retention <= time.time():
-            state = json.loads(payload)
-            connection.execute(
-                "UPDATE jobs SET payload=? WHERE key=?",
-                (json.dumps(_without_text(state), ensure_ascii=False), key),
-            )
-            if retention:
-                _MEMORY.pop(state["job_id"], None)
-    connection.commit()
-    return connection
+    try:
+        connection.execute("PRAGMA secure_delete=ON")
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS jobs (key TEXT PRIMARY KEY, payload TEXT NOT NULL, created REAL NOT NULL)"
+        )
+        retention = audio.retention_seconds()
+        for key, payload, created in connection.execute(
+            "SELECT key,payload,created FROM jobs"
+        ).fetchall():
+            if retention == 0 or created + retention <= time.time():
+                state = json.loads(payload)
+                stripped = json.dumps(_without_text(state), ensure_ascii=False)
+                if stripped != payload:
+                    connection.execute("UPDATE jobs SET payload=? WHERE key=?", (stripped, key))
+                if retention:
+                    _MEMORY.pop(state["job_id"], None)
+        connection.commit()
+        with connection:
+            yield connection
+    finally:
+        connection.close()
 
 
 def _save(key, state):

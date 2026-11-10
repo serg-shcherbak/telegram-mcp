@@ -259,21 +259,23 @@ class DotMCP(FastMCP):
             function = tool.fn
             if name == "list_chats":
                 function = self._nullable_list_chats(tool.fn)
+            if name == "send_message":
+                description = SEND_DESCRIPTION + "\n\n" + tool.description
+            elif name == "list_chats":
+                description = (
+                    "List available chats. limit defaults to null (all dialogs); an integer "
+                    "caps Telegram dialogs before filtering unread/type/archive. with_about "
+                    "requires an explicit positive limit at most 100. " + tool.description
+                )
+            elif name == "transcribe_voice":
+                description = ASR_DESCRIPTION
+            else:
+                description = tool.description
             self.add_tool(
                 function,
                 name=name,
                 title=tool.title,
-                description=(
-                    SEND_DESCRIPTION + "\n\n" + tool.description
-                    if name == "send_message"
-                    else (
-                        "List available chats. limit defaults to null (all dialogs); an integer "
-                        "caps Telegram dialogs before filtering unread/type/archive. with_about "
-                        "requires an explicit positive limit at most 100. " + tool.description
-                        if name == "list_chats"
-                        else ASR_DESCRIPTION if name == "transcribe_voice" else tool.description
-                    )
-                ),
+                description=description,
                 annotations=(
                     ToolAnnotations(
                         readOnlyHint=False,

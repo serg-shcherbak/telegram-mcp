@@ -402,8 +402,9 @@ def _connect() -> sqlite3.Connection:
         """)
     _migrate_source_into_key(conn)
     conn.execute(
-        "UPDATE transcripts SET expires_at = MIN(expires_at, COALESCE(unixepoch(created_at), 0) + ?)",
-        (retention_seconds(),),
+        "UPDATE transcripts SET expires_at = COALESCE(unixepoch(created_at), 0) + :retention "
+        "WHERE expires_at > COALESCE(unixepoch(created_at), 0) + :retention",
+        {"retention": retention_seconds()},
     )
     conn.execute("DELETE FROM transcripts WHERE expires_at <= ?", (time.time(),))
     if retention_seconds() == 0:
@@ -543,7 +544,6 @@ def save_transcript(
 
 
 def is_transcribable(msg) -> bool:
-    """Voice notes, video circles and ordinary audio use the same engine path."""
     return any(getattr(msg, name, None) is not None for name in ("voice", "video_note", "audio"))
 
 
@@ -711,8 +711,6 @@ def _upload_name(msg) -> tuple:
 async def _transcribe_via_openai_compatible(
     cl, msg, cfg: HttpEngineConfig, *, entity=None
 ) -> dict:
-    """POST the recording to an OpenAI-style ``/audio/transcriptions``
-    endpoint (groq, openai), streaming the bounded temporary input."""
     if not cfg.url:
         return {"status": "error", "error": engine_config_error(cfg.engine)}
 
@@ -767,15 +765,14 @@ async def _post_audio(data, cfg, filename, mime):
         text = (payload.get("text") or "").strip()
     except httpx.HTTPStatusError as error:
         status = error.response.status_code
-        reason = (
-            "provider_credentials"
-            if status in (401, 403)
-            else (
-                "provider_unavailable"
-                if status == 429 or status >= 500
-                else "too_large" if status == 413 else "provider_rejected"
-            )
-        )
+        if status in (401, 403):
+            reason = "provider_credentials"
+        elif status == 429 or status >= 500:
+            reason = "provider_unavailable"
+        elif status == 413:
+            reason = "too_large"
+        else:
+            reason = "provider_rejected"
         return {
             "status": "error",
             "reason": reason,

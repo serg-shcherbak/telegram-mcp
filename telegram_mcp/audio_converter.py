@@ -1,5 +1,3 @@
-"""Isolated, one-part-at-a-time PCM conversion; the container needs no application code."""
-
 import asyncio
 import json
 import os

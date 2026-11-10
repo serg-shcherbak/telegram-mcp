@@ -334,6 +334,7 @@ def message_to_dict(msg, chat_id: Optional[int] = None, forum: bool = False) -> 
 
     text = sanitize_user_content(msg.message) if getattr(msg, "message", None) else ""
     rich = False
+    rich_text = ""
     if not text:
         # Block-format posts leave .message empty and keep the words in
         # .rich_message; without this the whole post reads back as "[empty]".
@@ -343,7 +344,7 @@ def message_to_dict(msg, chat_id: Optional[int] = None, forum: bool = False) -> 
             rich = True
     if text:
         d["text"] = text
-    raw_text = getattr(msg, "message", None) or rich_message_text(msg)
+    raw_text = getattr(msg, "message", None) or rich_text
     if len(raw_text) > 4096:
         d["text_coverage"] = {
             "complete": False,
@@ -1860,7 +1861,6 @@ async def get_message_context(
         ):
             raise ToolError("The requested context source is unavailable")
         album_id = getattr(central_message, "grouped_id", None)
-        # Fetch an album's neighboring messages even when the caller requests no text context.
         window = max(context_size, 11) if album_id else context_size
         messages_before = (
             list(await cl.get_messages(chat, limit=window, max_id=message_id)) if window else []
@@ -1871,9 +1871,7 @@ async def get_message_context(
             else []
         )
         selected = (
-            list(messages_before[:context_size])
-            + [central_message]
-            + list(messages_after[:context_size])
+            messages_before[:context_size] + [central_message] + messages_after[:context_size]
         )
         if album_id:
             selected.extend(
