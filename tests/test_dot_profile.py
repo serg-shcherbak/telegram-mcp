@@ -3,7 +3,7 @@
 import asyncio
 import json
 import socket
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, closing
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -314,7 +314,7 @@ async def test_asr_revocation_during_provider_withholds_and_does_not_cache(
     "change", ["model", "language", "attachment", "account", "session_account", "expiry"]
 )
 async def test_direct_audio_cache_identity_and_retention(
-    owner_config, core_client, direct_audio, monkeypatch, change
+    owner_config, core_client, direct_audio, monkeypatch, change, transcript_cache_dir
 ):
     import sqlite3
 
@@ -337,7 +337,10 @@ async def test_direct_audio_cache_identity_and_retention(
                     core_client, "_mb_entity_cache", SimpleNamespace(self_id=2), raising=False
                 )
             else:
-                with sqlite3.connect(transcription._cache_db_path()) as conn:
+                with (
+                    closing(sqlite3.connect(transcript_cache_dir / "dot-transcripts.db")) as conn,
+                    conn,
+                ):
                     conn.execute("UPDATE transcripts SET expires_at = 0")
             second = await session.call_tool("transcribe_voice", {"chat_id": 1, "message_id": 7})
             if change == "account":
@@ -760,11 +763,19 @@ async def test_cancelled_asr_releases_input_and_does_not_store_text(
             await task
         assert closed.is_set()
         assert transcription._INFLIGHT_LOCKS == {}
+        import sqlite3
+
+        with closing(sqlite3.connect(transcript_cache_dir / "dot-transcripts.db")) as conn:
+            assert conn.execute("SELECT COUNT(*) FROM transcripts").fetchone()[0] == 0
+            assert conn.execute("SELECT COUNT(*) FROM asr_posts").fetchone()[0] == 1
     finally:
         access.current_connection.reset(token)
     assert transcription.get_cached_transcript(1, 7) is None
     assert list(config.media_root.iterdir()) == []
-    assert {item.name for item in transcript_cache_dir.iterdir()} == {"transcripts.db"}
+    assert {item.name for item in transcript_cache_dir.iterdir()} == {
+        "dot-transcripts.db",
+        "transcripts.db",
+    }
 
 
 @pytest.mark.asyncio

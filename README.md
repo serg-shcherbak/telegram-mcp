@@ -125,6 +125,11 @@ Aliases live in `${XDG_STATE_HOME:-~/.local/state}/telegram-mcp/aliases.json` (o
 
 `TELEGRAM_TRANSCRIBE_LANGUAGE` (ISO-639-1, e.g. `nl`) is passed as a language hint to every engine except `telegram`; unset, the engines auto-detect. `TELEGRAM_TRANSCRIBE_TIMEOUT` (default 120 seconds) bounds a single request to the HTTP engines (`groq`, `openai`).
 
+Generic installations preserve existing transcript history by default. Set
+`TELEGRAM_TRANSCRIPT_RETENTION_SECONDS` explicitly to opt into expiry (zero disables
+storage). The private Dot profile uses a separate cache with seven-day default retention;
+its policy does not delete or reuse legacy generic transcripts.
+
 The engine is chosen per call via the `engine` argument, or otherwise defaults to `TELEGRAM_TRANSCRIBE_ENGINE` (`groq`, `telegram`, `openai` or `whisper`). Results are cached by `(chat_id, message_id, engine)` in a local SQLite file so repeat reads and repeat listings never re-transcribe the same message. Concurrent requests for the same uncached recording are collapsed too: the second one waits for the first and returns its transcript, so a burst of callers costs one paid call, not one per caller. Every transcript is returned with a `note` marking it as a machine transcript, not a verbatim quote — treat it as a paraphrase, not exact wording.
 
 `get_history`, `get_messages`, `list_messages`, `search_messages`, `search_global`, and `get_message_context` fill in already-cached transcripts for voice messages instead of leaving the text empty, controlled by `TELEGRAM_TRANSCRIBE`:

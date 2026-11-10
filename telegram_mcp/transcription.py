@@ -379,7 +379,8 @@ def cache_dir() -> Path:
 
 
 def _cache_db_path() -> Path:
-    return cache_dir() / "transcripts.db"
+    name = "dot-transcripts.db" if current_connection.get() is not None else "transcripts.db"
+    return cache_dir() / name
 
 
 def _connect() -> sqlite3.Connection:
@@ -401,21 +402,44 @@ def _connect() -> sqlite3.Connection:
         )
         """)
     _migrate_source_into_key(conn)
-    conn.execute(
-        "UPDATE transcripts SET expires_at = "
-        "COALESCE(CAST(strftime('%s', created_at) AS INTEGER), 0) + :retention "
-        "WHERE expires_at > COALESCE(CAST(strftime('%s', created_at) AS INTEGER), 0) + :retention",
-        {"retention": retention_seconds()},
-    )
-    conn.execute("DELETE FROM transcripts WHERE expires_at <= ?", (time.time(),))
-    if retention_seconds() == 0:
-        conn.execute("DELETE FROM transcripts")
+    conn.execute("CREATE TABLE IF NOT EXISTS asr_posts (identity TEXT PRIMARY KEY)")
+    if (
+        current_connection.get() is not None
+        or "TELEGRAM_TRANSCRIPT_RETENTION_SECONDS" in os.environ
+    ):
+        conn.execute(
+            "UPDATE transcripts SET expires_at = "
+            "COALESCE(CAST(strftime('%s', created_at) AS INTEGER), 0) + :retention "
+            "WHERE expires_at > COALESCE(CAST(strftime('%s', created_at) AS INTEGER), 0) + :retention",
+            {"retention": retention_seconds()},
+        )
+        conn.execute("DELETE FROM transcripts WHERE expires_at <= ?", (time.time(),))
+        if retention_seconds() == 0:
+            conn.execute("DELETE FROM transcripts")
     conn.commit()
     try:
         os.chmod(path, 0o600)
     except OSError:
         pass
     return conn
+
+
+def _post_checkpoint(identity, *, clear=False):
+    """Keep a durable fence until a POST has a known outcome and its result is saved."""
+    conn = _connect()
+    try:
+        cursor = conn.execute(
+            (
+                "DELETE FROM asr_posts WHERE identity = ?"
+                if clear
+                else "INSERT OR IGNORE INTO asr_posts VALUES (?)"
+            ),
+            (identity,),
+        )
+        conn.commit()
+        return cursor.rowcount == 1
+    finally:
+        conn.close()
 
 
 def _migrate_source_into_key(conn: sqlite3.Connection) -> None:
@@ -490,8 +514,12 @@ def get_cached_transcript(
     finally:
         conn.close()
     if row is None:
+        if identity and current_connection.get() is None:
+            return get_cached_transcript(chat_id, message_id, source, identity="")
         return None
     check_transcript_access(chat_id)
+    if current_connection.get() is not None:
+        _post_checkpoint(identity, clear=True)
     source, text, duration, lang, created_at = row
     return {
         "source": source,
@@ -517,6 +545,8 @@ def save_transcript(
     try:
         ttl = retention_seconds()
         if ttl == 0:
+            if current_connection.get() is not None:
+                _post_checkpoint(identity, clear=True)
             return
         conn.execute(
             "INSERT OR REPLACE INTO transcripts "
@@ -534,6 +564,8 @@ def save_transcript(
                 time.time() + ttl,
             ),
         )
+        if current_connection.get() is not None:
+            conn.execute("DELETE FROM asr_posts WHERE identity = ?", (identity,))
         conn.commit()
     finally:
         conn.close()
@@ -735,7 +767,20 @@ async def _transcribe_via_openai_compatible(
                 source,
             )
         filename, mime = _upload_name(msg)
-        return await _post_audio(data, cfg, filename, mime)
+        if source is not None and not _post_checkpoint(source):
+            return {
+                "status": "error",
+                "reason": "provider_outcome_unknown",
+                "error": "An earlier ASR request has an unresolved outcome. Do not retry automatically.",
+            }
+        result = await _post_audio(data, cfg, filename, mime)
+        if (
+            source is not None
+            and result.get("status") != "ok"
+            and result.get("reason") != "provider_outcome_unknown"
+        ):
+            _post_checkpoint(source, clear=True)
+        return result
     finally:
         data.close()
 
@@ -909,7 +954,7 @@ async def transcribe(cl, entity, msg, engine: str) -> dict:
             if result.get("reason") == "too_large":
                 result = await jobs.request(cl, entity, msg, cfg, identity)
         check_transcript_access(get_marked_id(msg.peer_id), operation=True)
-        if result.get("reason") != "provider_unavailable":
+        if result.get("job_id") or result.get("reason") != "provider_unavailable":
             return dict(
                 result,
                 source="openai",

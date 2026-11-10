@@ -110,8 +110,9 @@ provider pricing. A key alone is not consent. Reading history and background eve
 do not trigger external ASR. `transcribe_voice` requires read and external ASR scope,
 independently of attachment export; the default model is `gpt-transcribe` at the
 official `https://api.openai.com/v1` endpoint. Leave the API key blank and scopes empty
-until the owner opts in. Native Telegram fallback applies only to voice/video notes,
-not ordinary audio files. Results identify engine, fallback and completeness.
+until the owner opts in. Native Telegram fallback applies only to direct short
+voice/video notes. A failed long job returns its completed parts and coverage rather
+than replacing them with fallback. Results identify engine, fallback and completeness.
 
 Known short audio (at most 600 seconds, supported codec and at most 24,000,000 bytes)
 can use the direct path. Long/unknown duration, oversized or other-codec audio uses a
@@ -125,8 +126,9 @@ and 24,000,000 bytes. Status exposes sample rate, offsets, completed/unknown ran
 unprocessed time and partial coverage. Do not present partial text as a full transcript.
 
 Permission and source identity are checked before each provider part and each result.
-An uncertain paid request is recorded as unknown and is never retried automatically,
-including after restart. A terminal failed/expired job does not restart on polling the
+An uncertain paid request, including a direct short request or cancellation during
+upload, is recorded durably and is never retried automatically, including after restart.
+A terminal failed/expired job does not restart on polling the
 same identity; deliberate operator reset or a new source identity is required.
 Cancellation is not a retry/reset command. See [long-audio verification](../../docs/acceptance/long-audio.md)
 for measured coverage and the limits of synthetic evidence. No live provider accuracy,
@@ -137,7 +139,14 @@ options. Default text retention is seven days. Expiration is applied on access, 
 a background purge timer. With `TELEGRAM_TRANSCRIPT_RETENTION_SECONDS=0`, direct cache
 storage is disabled and job text stays only in memory until retrieval, the next new
 job or restart; job metadata/tombstones remain. Cache/job databases are plaintext in
-private state outside allowed media roots. Keep them and all backups private.
+private state outside allowed media roots. The private cache is `dot-transcripts.db`;
+the generic server's existing `transcripts.db` remains separate and is not purged by
+private-profile retention. Unresolved short-POST checkpoints remain after text expiry.
+Keep these databases and all backups private.
+
+Known timeout limit: the converter waits 180 seconds for each part acknowledgement.
+The default provider timeout is 120 seconds; increasing it beyond the converter wait
+can interrupt conversion after a paid part. Real provider latency has not been measured.
 
 ## Start only the selected installation
 

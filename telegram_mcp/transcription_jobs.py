@@ -156,6 +156,16 @@ def _public(state):
         )
     }
     result["cached"] = state["status"] == "ok"
+    if result["unknown_ranges"] and result["unprocessed_ranges"]:
+        result["unprocessed_ranges"] = [
+            {
+                "start_sample": max(
+                    result["unprocessed_ranges"][0]["start_sample"],
+                    max(part["end_sample"] for part in result["unknown_ranges"]),
+                ),
+                "end_sample": None,
+            }
+        ]
     result["source"] = "openai"
     result["sample_rate"] = converter.SAMPLE_RATE
     result["duration"] = state["end_sample"] / converter.SAMPLE_RATE if state["complete"] else None

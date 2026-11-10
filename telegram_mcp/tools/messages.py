@@ -1667,8 +1667,9 @@ async def transcribe_voice(
 
     Cache identity includes account, canonical chat, message, attachment version,
     provider/model and language. Every call checks the current source first.
-    Text expires after seven days by default; TELEGRAM_TRANSCRIPT_RETENTION_SECONDS
-    configures retention, with zero disabling storage.
+    Private Dot text expires after seven days by default; generic installations
+    preserve existing text unless TELEGRAM_TRANSCRIPT_RETENTION_SECONDS is set,
+    with zero disabling storage.
 
     Long or unknown-duration private audio starts a background job. Repeat this
     tool for the same source to poll; cancel=True stops that job. Part offsets
