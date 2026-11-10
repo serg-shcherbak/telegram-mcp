@@ -16,7 +16,8 @@ SAMPLE_RATE = 16000
 MAX_SAMPLES = 14400 * SAMPLE_RATE
 PART_PCM_BYTES = 600 * SAMPLE_RATE * 2
 CONVERSION_TIMEOUT = 120
-ACK_TIMEOUT = 180
+# A part may need two provider attempts; the owner job has a two-hour wall limit.
+ACK_TIMEOUT = 7200
 
 
 class ConversionError(Exception):

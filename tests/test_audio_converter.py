@@ -141,3 +141,9 @@ def test_duration_limit_is_an_error_and_never_a_silent_trim(tmp_path, decoder, m
     with pytest.raises(converter.ConversionError, match="duration limit"):
         next(parts)
     assert not (folder / "part.wav").exists()
+
+
+def test_converter_ack_wait_covers_two_attempts_within_owner_job_budget():
+    from telegram_mcp import transcription_jobs
+
+    assert converter.ACK_TIMEOUT >= transcription_jobs.MAX_JOB_SECONDS

@@ -91,7 +91,7 @@ def _save(key, state):
     )
     with _connect() as connection:
         connection.execute(
-            "INSERT INTO jobs VALUES (?,?,?) ON CONFLICT(key) DO UPDATE SET payload=excluded.payload",
+            "INSERT INTO jobs VALUES (?,?,?) ON CONFLICT(key) DO UPDATE SET payload=excluded.payload,created=excluded.created",
             (key, json.dumps(persisted, ensure_ascii=False), state["created"]),
         )
 
@@ -167,6 +167,13 @@ def _public(state):
             }
         ]
     result["source"] = "openai"
+    if state.get("retry_exhausted"):
+        result.update(
+            retry_exhausted=True,
+            attempts=2,
+            error="ASR failed twice. Automatic attempts stopped. Completed parts are preserved. "
+            "Ask the owner before a new request; use restart=true only for that explicit request.",
+        )
     result["sample_rate"] = converter.SAMPLE_RATE
     result["duration"] = state["end_sample"] / converter.SAMPLE_RATE if state["complete"] else None
     result["limits"] = {
@@ -180,7 +187,7 @@ def _public(state):
     return result
 
 
-async def request(cl, entity, msg, cfg, identity, *, cancel=False):
+async def request(cl, entity, msg, cfg, identity, *, cancel=False, restart=False):
     global _ACTIVE
     from telegram_mcp import transcription as audio
     from telegram_mcp.runtime import get_marked_id
@@ -192,6 +199,17 @@ async def request(cl, entity, msg, cfg, identity, *, cancel=False):
     with _connect() as connection:
         row = connection.execute("SELECT payload FROM jobs WHERE key=?", (key,)).fetchone()
     state = json.loads(row[0]) if row else None
+    completed = []
+    part_bytes = min(cfg.max_bytes, converter.MAX_PART_BYTES)
+    if restart and not cancel and state and state["status"] != "pending":
+        # A fresh owner request is distinct from polling a durable failure fence.
+        if busy() or audio._AUDIO_LOCK.locked():
+            return {"status": "error", "reason": "asr_busy", "complete": False}
+        state = _MEMORY.pop(state["job_id"], state)
+        if all("text" in part for part in state["parts"]):
+            completed = state["parts"]
+            part_bytes = state.get("part_bytes", part_bytes)
+        state = None
     if state:
         state = _MEMORY.get(state["job_id"], state)
         task = _TASKS.get(state["job_id"])
@@ -225,12 +243,15 @@ async def request(cl, entity, msg, cfg, identity, *, cancel=False):
         "status": "pending",
         "job_id": uuid4().hex,
         "complete": False,
-        "parts": [],
+        "parts": completed,
+        "part_bytes": part_bytes,
         "unknown_ranges": [],
-        "unprocessed_ranges": [{"start_sample": 0, "end_sample": None}],
+        "unprocessed_ranges": [
+            {"start_sample": completed[-1]["end_sample"] if completed else 0, "end_sample": None}
+        ],
         "reason": "pending",
         "created": time.time(),
-        "end_sample": 0,
+        "end_sample": completed[-1]["end_sample"] if completed else 0,
         "posting": None,
     }
     _MEMORY.clear()
@@ -275,11 +296,22 @@ async def _run(key, state, root, cl, entity, msg, cfg, identity, chat_id):
             data = None
             await validate()
             parts = converter.receive_parts(
-                root, state["job_id"], min(cfg.max_bytes, converter.MAX_PART_BYTES)
+                root,
+                state["job_id"],
+                state.get("part_bytes", min(cfg.max_bytes, converter.MAX_PART_BYTES)),
             )
             try:
                 async for part, path in parts:
                     await validate()
+                    if part["index"] < len(state["parts"]):
+                        previous = state["parts"][part["index"]]
+                        if any(
+                            part[field] != previous[field] for field in ("start_sample", "frames")
+                        ):
+                            raise converter.ConversionError(
+                                "Retained audio part boundaries changed."
+                            )
+                        continue
                     source_range = {
                         "start_sample": part["start_sample"],
                         "end_sample": part["start_sample"] + part["frames"],
@@ -287,13 +319,20 @@ async def _run(key, state, root, cl, entity, msg, cfg, identity, chat_id):
                     state["posting"] = source_range
                     _save(key, state)
                     with path.open("rb") as stream:
-                        result = await audio._post_audio(stream, cfg, "part.wav", "audio/wav")
+                        result = await audio._post_audio_with_retry(
+                            stream, cfg, "part.wav", "audio/wav", validate
+                        )
                     await validate()
                     if result["status"] != "ok":
                         state.update(
-                            status="error", reason=result.get("reason", "provider_rejected")
+                            status="error",
+                            reason=result.get("reason", "provider_rejected"),
+                            retry_exhausted=result.get("retry_exhausted", False),
                         )
-                        if result.get("reason") == "provider_outcome_unknown":
+                        if (
+                            result.get("outcome_unknown")
+                            or result.get("reason") == "provider_outcome_unknown"
+                        ):
                             state["unknown_ranges"].append(source_range)
                         return
                     state["parts"].append(

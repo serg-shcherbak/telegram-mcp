@@ -45,10 +45,14 @@ async def test_unknown_short_post_survives_waiting_callers_and_restart(
         async with _session(app, TOKEN_A) as session:
             results = await asyncio.gather(call(session), call(session))
             assert all(value[1]["reason"] == "provider_outcome_unknown" for value in results)
+            assert all(
+                value[1]["retry_exhausted"] and value[1]["attempts"] == 2 for value in results
+            )
             transcription._INFLIGHT_LOCKS.clear()
             _, again = await call(session)
             assert again["reason"] == "provider_outcome_unknown"
-    assert len(posts) == 1
+            assert again["retry_exhausted"] and again["attempts"] == 2
+    assert len(posts) == 2
 
 
 @pytest.mark.asyncio

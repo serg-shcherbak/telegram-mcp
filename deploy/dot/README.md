@@ -110,9 +110,10 @@ provider pricing. A key alone is not consent. Reading history and background eve
 do not trigger external ASR. `transcribe_voice` requires read and external ASR scope,
 independently of attachment export; the default model is `gpt-transcribe` at the
 official `https://api.openai.com/v1` endpoint. Leave the API key blank and scopes empty
-until the owner opts in. Native Telegram fallback applies only to direct short
-voice/video notes. A failed long job returns its completed parts and coverage rather
-than replacing them with fallback. Results identify engine, fallback and completeness.
+until the owner opts in. The first provider error is repeated once immediately,
+including an unknown paid outcome (duplicate provider charges are accepted). After
+the second error the tool stops and reports failure with completed parts and coverage;
+there is no native Telegram fallback. Results identify engine and completeness.
 
 Known short audio (at most 600 seconds, supported codec and at most 24,000,000 bytes)
 can use the direct path. Long/unknown duration, oversized or other-codec audio uses a
@@ -125,12 +126,22 @@ four decoded hours and two hours job wall time; each WAV part is at most ten min
 and 24,000,000 bytes. Status exposes sample rate, offsets, completed/unknown ranges,
 unprocessed time and partial coverage. Do not present partial text as a full transcript.
 
-Permission and source identity are checked before each provider part and each result.
-An uncertain paid request, including a direct short request or cancellation during
-upload, is recorded durably and is never retried automatically, including after restart.
-A terminal failed/expired job does not restart on polling the
-same identity; deliberate operator reset or a new source identity is required.
-Cancellation is not a retry/reset command. See [long-audio verification](../../docs/acceptance/long-audio.md)
+Permission, source identity and configuration are checked again immediately before
+the second POST. The same bounded input is rewound; completed parts are not uploaded
+again. Local limits, invalid configuration, cancellation or revoked access do not
+authorize another upload. A durable fence prevents polling, concurrent calls or process
+restart from creating another automatic pair after failure or interruption.
+Direct private uploads split the actual remaining tool deadline between two provider
+attempts and source checks/response. Each provider timeout is bounded by that remainder,
+recomputed after retry validation, so a slow first provider fails before the whole
+tool call is cancelled. Explicit user/transport cancellation still stops immediately.
+Long jobs keep the configured provider timeout under their own two-hour wall budget.
+For a fresh explicit owner request, call the same tool with `restart=True`: a terminal
+long job resumes from retained completed parts, while an expired result can be generated
+again without server editing. Never use restart for polling. Cancellation is not reset.
+The converter waits at most the existing two-hour job budget for each part acknowledgement,
+so two provider attempts are not cut off by the former three-minute acknowledgement limit.
+See [long-audio verification](../../docs/acceptance/long-audio.md)
 for measured coverage and the limits of synthetic evidence. No live provider accuracy,
 latency or maximum-source acceptance is claimed.
 

@@ -191,6 +191,7 @@ mcp = FastMCP("telegram", stateless_http=True)
 # annotations into the final CallToolResult, preserving structured output.
 _USER_AUDIENCE = Annotations(audience=["user"])
 TOOL_TIMEOUT_SECONDS_DEFAULT = 55.0
+_tool_deadline: ContextVar[Optional[float]] = ContextVar("tool_deadline", default=None)
 
 
 def _tool_timeout_seconds(value: Optional[str] = None) -> Optional[float]:
@@ -223,6 +224,7 @@ def _install_annotation_hook(server: Optional[FastMCP] = None) -> None:
         if timeout is None:
             response = await original_handler(req)
         else:
+            token = _tool_deadline.set(asyncio.get_running_loop().time() + timeout)
             try:
                 response = await asyncio.wait_for(original_handler(req), timeout=timeout)
             except asyncio.TimeoutError:
@@ -243,6 +245,8 @@ def _install_annotation_hook(server: Optional[FastMCP] = None) -> None:
                         isError=True,
                     )
                 )
+            finally:
+                _tool_deadline.reset(token)
         if isinstance(response, ServerResult) and isinstance(response.root, CallToolResult):
             content = response.root.content
             if content:

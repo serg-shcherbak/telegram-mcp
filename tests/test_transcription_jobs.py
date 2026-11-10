@@ -305,3 +305,138 @@ async def test_restart_recovers_other_source_before_new_download(
             assert result["complete"] is True
             assert not orphan.exists()
             assert (sentinel / "keep.txt").read_text() == "unrelated existing directory"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changed_layout", [False, True])
+async def test_failed_part_retries_once_preserves_prior_parts_and_explicit_restart_resumes(
+    owner_config, long_audio, monkeypatch, changed_layout
+):
+    path, _ = owner_config
+    posts = []
+    failing = True
+
+    async def post(data, *args):
+        content = data.read()
+        posts.append(content)
+        if len(posts) > 1 and failing:
+            return {"status": "error", "reason": "provider_outcome_unknown"}
+        return {"status": "ok", "text": "first" if len(posts) == 1 else "second"}
+
+    monkeypatch.setattr(transcription, "_post_audio", post)
+    async with _server(path) as (_, app):
+        async with _session(app, TOKEN_A) as session:
+            _, pending = await call(session)
+            await settled(pending["job_id"])
+            result, failed = await call(session)
+            assert result.isError
+            assert failed["retry_exhausted"] is True
+            assert failed["parts"][0]["text"] == "first"
+            assert failed["unknown_ranges"] == [{"start_sample": 4, "end_sample": 8}]
+            assert len(posts) == 3 and posts[1] == posts[2]
+            await call(session)
+            assert len(posts) == 3
+            # Model a process restart: only the durable result/fence remains.
+            jobs._MEMORY.clear()
+            await call(session)
+            assert len(posts) == 3
+            failing = False
+            if changed_layout:
+                original_parts = jobs.converter.receive_parts
+
+                async def changed_parts(*args):
+                    async for part, source in original_parts(*args):
+                        yield dict(part, frames=part["frames"] + 1), source
+
+                monkeypatch.setattr(jobs.converter, "receive_parts", changed_parts)
+            _, fresh = await call(session, restart=True)
+            await settled(fresh["job_id"])
+            _, complete = await call(session)
+            if changed_layout:
+                assert complete["reason"] == "conversion_failed"
+                assert complete["parts"][0]["text"] == "first"
+            else:
+                assert complete["text"] == "first\nsecond"
+                assert complete["complete"] is True
+    assert len(posts) == (3 if changed_layout else 4) and posts[-1] == posts[1]
+
+
+@pytest.mark.asyncio
+async def test_expired_success_can_be_requested_again_explicitly(owner_config, long_audio):
+    path, _ = owner_config
+    async with _server(path) as (_, app):
+        async with _session(app, TOKEN_A) as session:
+            _, pending = await call(session)
+            await settled(pending["job_id"])
+            _, complete = await call(session)
+            assert complete["complete"] is True
+            with sqlite3.connect(transcription.cache_dir() / "audio-jobs.db") as connection:
+                key, payload = connection.execute("SELECT key,payload FROM jobs").fetchone()
+                state = json.loads(payload)
+                state["created"] = time.time() - 8 * 86400
+                connection.execute(
+                    "UPDATE jobs SET payload=?,created=? WHERE key=?",
+                    (json.dumps(state), state["created"], key),
+                )
+            jobs._MEMORY.clear()
+            _, expired = await call(session)
+            assert expired["reason"] == "result_not_retained"
+            assert len(long_audio["posts"]) == 2
+            _, fresh = await call(session, restart=True)
+            await settled(fresh["job_id"])
+            _, complete = await call(session)
+            assert complete["complete"] is True
+    assert len(long_audio["posts"]) == 4
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["rights", "source", "key"])
+async def test_provider_retry_revalidates_before_second_part_upload(
+    owner_config, direct_audio, long_audio, monkeypatch, change
+):
+    path, config = owner_config
+    posts = []
+
+    async def post(*args):
+        posts.append(1)
+        if change == "rights":
+            config["profiles"]["reader"]["external_asr"] = []
+            _write_config(path, config)
+        elif change == "source":
+            direct_audio["message"].document.id += 1
+        else:
+            monkeypatch.delenv("TELEGRAM_TRANSCRIBE_OPENAI_API_KEY")
+        return {"status": "error", "reason": "provider_outcome_unknown"}
+
+    monkeypatch.setattr(transcription, "_post_audio", post)
+    async with _server(path) as (_, app):
+        async with _session(app, TOKEN_A) as session:
+            _, pending = await call(session)
+            await settled(pending["job_id"])
+    assert posts == [1]
+
+
+@pytest.mark.asyncio
+async def test_long_part_retry_success_does_not_repeat_other_parts(
+    owner_config, long_audio, monkeypatch
+):
+    path, _ = owner_config
+    posts = []
+
+    async def post(stream, *args):
+        posts.append(stream.read())
+        if len(posts) == 1:
+            return {"status": "error", "reason": "provider_unavailable"}
+        return {"status": "ok", "text": f"part {len(posts) - 1}"}
+
+    monkeypatch.setattr(transcription, "_post_audio", post)
+    async with _server(path) as (_, app):
+        async with _session(app, TOKEN_A) as session:
+            _, pending = await call(session)
+            await settled(pending["job_id"])
+            _, result = await call(session)
+            assert result["text"] == "part 1\npart 2"
+            assert result["complete"] is True
+            assert result["unknown_ranges"] == []
+    assert len(posts) == 3 and posts[0] == posts[1] and posts[1] != posts[2]
+    assert long_audio["downloads"] == [7]

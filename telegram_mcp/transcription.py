@@ -37,7 +37,7 @@ import sqlite3
 import tempfile
 import time
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -45,7 +45,12 @@ from typing import Optional
 import httpx
 from telethon.tl import functions
 
-from telegram_mcp.runtime import account_is_premium, get_marked_id, is_premium_rpc_error
+from telegram_mcp.runtime import (
+    _tool_deadline,
+    account_is_premium,
+    get_marked_id,
+    is_premium_rpc_error,
+)
 from telegram_mcp.access import AccessDenied, current_connection, current_operation
 
 # ---------------------------------------------------------------------------
@@ -344,6 +349,8 @@ async def _revalidate_audio_source(cl, entity, chat_id, message_id, engine, iden
     if current_connection.get() is None:
         return
     check_transcript_access(chat_id, operation=True)
+    if engine_config_error(engine):
+        raise AccessDenied("ASR configuration changed; external dispatch stopped")
     current = await cl.get_messages(entity, ids=message_id)
     if (
         not current
@@ -403,6 +410,8 @@ def _connect() -> sqlite3.Connection:
         """)
     _migrate_source_into_key(conn)
     conn.execute("CREATE TABLE IF NOT EXISTS asr_posts (identity TEXT PRIMARY KEY)")
+    if "failure" not in {row[1] for row in conn.execute("PRAGMA table_info(asr_posts)")}:
+        conn.execute("ALTER TABLE asr_posts ADD COLUMN failure TEXT")
     if (
         current_connection.get() is not None
         or "TELEGRAM_TRANSCRIPT_RETENTION_SECONDS" in os.environ
@@ -432,12 +441,39 @@ def _post_checkpoint(identity, *, clear=False):
             (
                 "DELETE FROM asr_posts WHERE identity = ?"
                 if clear
-                else "INSERT OR IGNORE INTO asr_posts VALUES (?)"
+                else "INSERT OR IGNORE INTO asr_posts (identity) VALUES (?)"
             ),
             (identity,),
         )
         conn.commit()
         return cursor.rowcount == 1
+    finally:
+        conn.close()
+
+
+def _post_failure(identity, result=None):
+    conn = _connect()
+    try:
+        if result is not None:
+            conn.execute(
+                "UPDATE asr_posts SET failure=? WHERE identity=?",
+                (json.dumps(result, ensure_ascii=False), identity),
+            )
+            conn.commit()
+        row = conn.execute(
+            "SELECT failure FROM asr_posts WHERE identity=?", (identity,)
+        ).fetchone()
+        if not row:
+            return None
+        return (
+            json.loads(row[0])
+            if row[0]
+            else {
+                "status": "error",
+                "reason": "provider_outcome_unknown",
+                "error": "An earlier ASR request has an unresolved outcome. Do not retry automatically.",
+            }
+        )
     finally:
         conn.close()
 
@@ -751,13 +787,17 @@ async def _transcribe_via_openai_compatible(
     if current_connection.get() is not None:
         peer_id, message_id = get_marked_id(msg.peer_id), msg.id
         source = transcript_identity(msg, peer_id, cfg.engine, cl)
+        failure = _post_failure(source)
+        if failure:
+            return failure
 
     data, error = await _download_audio(cl, msg, cfg.max_bytes, cfg)
     if error is not None:
         return error
 
     try:
-        if current_connection.get() is not None:
+
+        async def validate():
             await _revalidate_audio_source(
                 cl,
                 entity if entity is not None else msg.peer_id,
@@ -766,23 +806,64 @@ async def _transcribe_via_openai_compatible(
                 cfg.engine,
                 source,
             )
+
+        if source is not None:
+            await validate()
         filename, mime = _upload_name(msg)
         if source is not None and not _post_checkpoint(source):
-            return {
+            return _post_failure(source) or {
                 "status": "error",
                 "reason": "provider_outcome_unknown",
                 "error": "An earlier ASR request has an unresolved outcome. Do not retry automatically.",
             }
-        result = await _post_audio(data, cfg, filename, mime)
-        if (
-            source is not None
-            and result.get("status") != "ok"
-            and result.get("reason") != "provider_outcome_unknown"
-        ):
-            _post_checkpoint(source, clear=True)
-        return result
+        if source is not None:
+            result = await _post_audio_with_retry(
+                data, cfg, filename, mime, validate, deadline=_tool_deadline.get()
+            )
+            if result.get("reason") == "too_large" and not result.get("provider_error"):
+                _post_checkpoint(source, clear=True)
+            elif result.get("status") == "error":
+                _post_failure(source, result)
+            return result
+        return await _post_audio(data, cfg, filename, mime)
     finally:
         data.close()
+
+
+async def _post_audio_with_retry(data, cfg, filename, mime, validate, *, deadline=None):
+    """Dot authorizes one immediate repeat, including an uncertain paid outcome."""
+    if deadline is not None:
+        # Reserve a share for the second attempt and fresh checks/response.
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            raise TimeoutError
+        cfg = replace(cfg, timeout=min(cfg.timeout, remaining / 3))
+    result = await _post_audio(data, cfg, filename, mime)
+    if result.get("status") != "error" or not (
+        result.get("provider_error")
+        or result.get("reason", "").startswith("provider_")
+        or not result.get("reason")
+    ):
+        return result
+    unknown = result.get("reason") == "provider_outcome_unknown"
+    await validate()
+    if deadline is not None:
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            raise TimeoutError
+        cfg = replace(cfg, timeout=min(cfg.timeout, remaining / 2))
+    data.seek(0)
+    result = await _post_audio(data, cfg, filename, mime)
+    if result.get("status") == "error":
+        result = dict(
+            result,
+            attempts=2,
+            retry_exhausted=True,
+            outcome_unknown=unknown or result.get("reason") == "provider_outcome_unknown",
+            error="ASR failed twice. Automatic attempts stopped. Completed parts are preserved. "
+            "Ask the owner before a new request; use restart=true only for that explicit request.",
+        )
+    return result
 
 
 async def _post_audio(data, cfg, filename, mime):
@@ -822,6 +903,7 @@ async def _post_audio(data, cfg, filename, mime):
         return {
             "status": "error",
             "reason": reason,
+            "provider_error": True,
             "error": f"{cfg.engine} returned HTTP {status}.",
         }
     except httpx.ConnectError:
@@ -916,7 +998,7 @@ async def _transcribe_via_whisper(cl, msg) -> dict:
     return {"status": "ok", "text": text, "lang": lang or language}
 
 
-async def transcribe(cl, entity, msg, engine: str) -> dict:
+async def transcribe(cl, entity, msg, engine: str, *, restart=False) -> dict:
     """Dispatch to one engine. Returns a status dict:
     {"status": "ok", "text": ..., "lang": ...} |
     {"status": "pending"} | {"status": "premium_required"} |
@@ -945,36 +1027,22 @@ async def transcribe(cl, entity, msg, engine: str) -> dict:
             or (isinstance(declared, int) and declared > cfg.max_bytes)
             or extension not in {"flac", "mp3", "mp4", "mpeg", "mpga", "m4a", "ogg", "wav", "webm"}
         ):
-            result = await jobs.request(cl, entity, msg, cfg, identity)
+            result = await jobs.request(cl, entity, msg, cfg, identity, restart=restart)
         elif jobs.busy() or _AUDIO_LOCK.locked():
             result = {"status": "error", "reason": "asr_busy", "complete": False}
         else:
             async with _AUDIO_LOCK:
+                if restart:
+                    _post_checkpoint(identity, clear=True)
                 result = await _transcribe_via_openai_compatible(cl, msg, cfg, entity=entity)
-            if result.get("reason") == "too_large":
+            if result.get("reason") == "too_large" and not result.get("provider_error"):
                 result = await jobs.request(cl, entity, msg, cfg, identity)
         check_transcript_access(get_marked_id(msg.peer_id), operation=True)
-        if result.get("job_id") or result.get("reason") != "provider_unavailable":
-            return dict(
-                result,
-                source="openai",
-                complete=result.get("complete", result.get("status") == "ok"),
-                fallback_reason=None,
-            )
-        if getattr(msg, "voice", None) is None and getattr(msg, "video_note", None) is None:
-            return dict(
-                result,
-                reason="native_unsupported_media",
-                fallback_reason="provider_unavailable",
-                complete=False,
-            )
-        fallback = await _transcribe_via_telegram(cl, entity, msg)
-        check_transcript_access(get_marked_id(msg.peer_id), operation=True)
         return dict(
-            fallback,
-            source="telegram",
-            fallback_reason="provider_unavailable",
-            complete=fallback.get("status") == "ok",
+            result,
+            source="openai",
+            complete=result.get("complete", result.get("status") == "ok"),
+            fallback_reason=None,
         )
     if engine == "telegram":
         return await _transcribe_via_telegram(cl, entity, msg)
@@ -1039,9 +1107,17 @@ def _cached_result(row: dict) -> dict:
 
 
 async def transcribe_cached(
-    cl, entity, msg, engine: str, chat_id: int, duration: Optional[int] = None, *, cancel=False
+    cl,
+    entity,
+    msg,
+    engine: str,
+    chat_id: int,
+    duration: Optional[int] = None,
+    *,
+    cancel=False,
+    restart=False,
 ) -> dict:
-    """Cache-first transcription, at most one paid call per recording.
+    """Cache-first transcription with a bounded private provider retry.
 
     Same status dict as :func:`transcribe`, plus ``cached``. Every caller that
     would otherwise write to the transcript cache should go through here.
@@ -1072,7 +1148,10 @@ async def transcribe_cached(
     if hit is not None:
         return _cached_result(hit)
 
-    async with _transcribe_lock((chat_id, message_id, engine, identity)):
+    lock_key = (chat_id, message_id, engine, identity)
+    if restart and lock_key in _INFLIGHT_LOCKS:
+        return {"status": "error", "reason": "asr_busy", "complete": False}
+    async with _transcribe_lock(lock_key):
         # Re-read: a concurrent caller may have paid for this one while we
         # were waiting for the lock.
         check_transcript_access(chat_id, operation=True)
@@ -1083,7 +1162,11 @@ async def transcribe_cached(
 
         if duration is None:
             duration = voice_duration(msg)
-        result = await transcribe(cl, entity, msg, engine)
+        result = (
+            await transcribe(cl, entity, msg, engine, restart=True)
+            if restart and current_connection.get() is not None
+            else await transcribe(cl, entity, msg, engine)
+        )
         check_transcript_access(chat_id, operation=True)
         await _revalidate_audio_source(cl, entity, chat_id, message_id, engine, identity)
         if (

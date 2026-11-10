@@ -571,15 +571,15 @@ def test_private_openai_default_preserves_generic_core_default(
 @pytest.mark.parametrize(
     "media,status,expected_source,expected_reason",
     [
-        ("voice", 503, "telegram", None),
-        ("video_note", 503, "telegram", None),
-        ("audio", 503, "openai", "native_unsupported_media"),
+        ("voice", 503, "openai", "provider_unavailable"),
+        ("video_note", 503, "openai", "provider_unavailable"),
+        ("audio", 503, "openai", "provider_unavailable"),
         ("voice", 401, "openai", "provider_credentials"),
         ("voice", 413, "openai", "too_large"),
         ("voice", "timeout", "openai", "provider_outcome_unknown"),
     ],
 )
-async def test_private_provider_fallback_and_specific_failures(
+async def test_private_provider_two_failures_stop_without_native_fallback(
     owner_config,
     core_client,
     direct_audio,
@@ -648,9 +648,21 @@ async def test_private_provider_fallback_and_specific_failures(
             else:
                 assert payload["reason"] == expected_reason
                 assert payload["complete"] is False
+                assert payload["retry_exhausted"] is True
+                assert payload["attempts"] == 2
+                assert "failed twice" in payload["detail"]
                 assert native == []
-    assert len(posts) == 1
-    assert downloads == [1]
+            again = await session.call_tool("transcribe_voice", {"chat_id": 1, "message_id": 7})
+            assert again.isError
+            assert "failed twice" in _text(again)
+            assert len(posts) == 2
+            explicit = await session.call_tool(
+                "transcribe_voice", {"chat_id": 1, "message_id": 7, "restart": True}
+            )
+            assert explicit.isError
+            assert "failed twice" in _text(explicit)
+    assert len(posts) == 4
+    assert downloads == [1, 1]
 
 
 @pytest.mark.asyncio
@@ -1380,3 +1392,125 @@ async def test_sdk_preserves_core_timeout_and_untrusted_audience(
             result = await reader.call_tool("get_chats", {})
             assert not result.isError
             assert result.content[0].annotations.audience == ["user"]
+
+
+@pytest.mark.asyncio
+async def test_direct_retry_success_is_cached_for_concurrent_callers(
+    owner_config, core_client, direct_audio, monkeypatch
+):
+    path, _ = owner_config
+    uploads, downloads = [], []
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def download(*args, **kwargs):
+        downloads.append(1)
+        kwargs["file"].write(b"synthetic-audio")
+        return kwargs["file"]
+
+    async def post(stream, *args):
+        uploads.append(stream.read())
+        if len(uploads) == 1:
+            entered.set()
+            await release.wait()
+            return {"status": "error", "reason": "provider_outcome_unknown"}
+        return {"status": "ok", "text": "complete after retry"}
+
+    monkeypatch.setattr(transcription, "transcribe", direct_audio["real_transcribe"])
+    monkeypatch.setattr(core_client, "download_media", download, raising=False)
+    monkeypatch.setattr(transcription, "_post_audio", post)
+    async with _server(path) as (_, app):
+        async with _session(app, TOKEN_A) as session:
+            first = asyncio.create_task(
+                session.call_tool("transcribe_voice", {"chat_id": 1, "message_id": 7})
+            )
+            await asyncio.wait_for(entered.wait(), 1)
+            second = asyncio.create_task(
+                session.call_tool("transcribe_voice", {"chat_id": 1, "message_id": 7})
+            )
+            release.set()
+            results = await asyncio.gather(first, second)
+            for result in results:
+                assert not result.isError
+                assert json.loads(_text(result))["text"] == "complete after retry"
+            assert any(json.loads(_text(result))["cached"] for result in results)
+            await session.call_tool("transcribe_voice", {"chat_id": 1, "message_id": 7})
+    assert uploads == [b"synthetic-audio", b"synthetic-audio"]
+    assert downloads == [1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("second_succeeds", [True, False])
+async def test_private_direct_provider_retry_fits_actual_tool_deadline(
+    owner_config, core_client, direct_audio, monkeypatch, second_succeeds
+):
+    path, _ = owner_config
+    monkeypatch.setenv("TELEGRAM_TOOL_TIMEOUT_SECONDS", "0.6")
+    posts, timeouts, cancelled, downloads = [], [], [], []
+
+    async def download(*args, **kwargs):
+        downloads.append(1)
+        await asyncio.sleep(0.12)
+        kwargs["file"].write(b"synthetic-input")
+        return kwargs["file"]
+
+    class Provider:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def post(self, url, **kwargs):
+            posts.append(kwargs["files"]["file"][1].read())
+            if len(posts) == 2 and second_succeeds:
+                return httpx.Response(
+                    200, request=httpx.Request("POST", url), json={"text": "done"}
+                )
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.append(len(posts))
+                raise
+
+    def client(**kwargs):
+        timeouts.append(kwargs["timeout"])
+        return Provider()
+
+    original_fetch = core_client.get_messages
+    delayed = False
+
+    async def fetch(*args, **kwargs):
+        nonlocal delayed
+        if cancelled == [1] and not delayed:
+            delayed = True
+            await asyncio.sleep(0.17)
+        return await original_fetch(*args, **kwargs)
+
+    monkeypatch.setattr(transcription, "transcribe", direct_audio["real_transcribe"])
+    monkeypatch.setattr(core_client, "download_media", download, raising=False)
+    monkeypatch.setattr(core_client, "get_messages", fetch)
+    monkeypatch.setattr(
+        transcription,
+        "httpx",
+        SimpleNamespace(
+            AsyncClient=client,
+            HTTPStatusError=httpx.HTTPStatusError,
+            ConnectError=httpx.ConnectError,
+        ),
+    )
+    async with _server(path) as (_, app):
+        async with _session(app, TOKEN_A) as session:
+            result = await session.call_tool("transcribe_voice", {"chat_id": 1, "message_id": 7})
+            assert "GEN-TIMEOUT" not in _text(result)
+            payload = json.loads(_text(result)[_text(result).index("{") :])
+            assert result.isError is not second_succeeds
+            if second_succeeds:
+                assert payload["text"] == "done"
+            else:
+                assert payload["attempts"] == 2 and payload["retry_exhausted"] is True
+            await session.call_tool("transcribe_voice", {"chat_id": 1, "message_id": 7})
+    assert posts == [b"synthetic-input", b"synthetic-input"]
+    assert downloads == [1]
+    assert cancelled == ([1] if second_succeeds else [1, 2])
+    assert len(timeouts) == 2 and all(0 < timeout < 0.18 for timeout in timeouts)
+    assert timeouts[1] < timeouts[0]

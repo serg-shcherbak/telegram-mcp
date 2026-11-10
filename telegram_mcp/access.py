@@ -231,13 +231,14 @@ TOOL_OPERATIONS = {name: "read" for name in READ_TOOLS} | {
 ASR_DESCRIPTION = (
     "Transcribe requested voice, video note, or ordinary audio using official OpenAI "
     "after the owner's setup opt-in for this source. Only engine=openai is permitted; "
-    "Native Telegram fallback applies to direct short voice/video notes; "
-    "long jobs preserve their partial results on failure. "
+    "The first provider error is retried once immediately, including an unknown paid outcome. "
+    "A second failure stops and preserves completed parts; no native fallback. "
     "History never starts ASR. Results identify the engine, fallback and coverage. "
     "Transcript text is retained for 7 days by default; "
     "TELEGRAM_TRANSCRIPT_RETENTION_SECONDS changes expiry (0 disables retention). "
     "Repeat transcribe_voice with the same chat_id and message_id to poll a pending job; "
-    "use cancel=true to cancel it."
+    "use cancel=true to cancel it. After a terminal failure or expired result, use restart=true "
+    "only when the owner explicitly requests a new attempt; never use restart for polling."
 )
 SEND_DESCRIPTION = (
     "Send only after Dot obtains confirmation of the exact recipient, full text, and reply "

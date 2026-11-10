@@ -1645,6 +1645,7 @@ async def transcribe_voice(
     engine: Optional[str] = None,
     account: Optional[str] = None,
     cancel: bool = False,
+    restart: bool = False,
 ) -> str:
     """
     Transcribe a voice message, video note (video circle), or ordinary audio file to text.
@@ -1673,8 +1674,10 @@ async def transcribe_voice(
 
     Long or unknown-duration private audio starts a background job. Repeat this
     tool for the same source to poll; cancel=True stops that job. Part offsets
-    are decoded mono 16 kHz sample positions. Interrupted or uncertain provider
-    ranges are never automatically submitted again.
+    are decoded mono 16 kHz sample positions. Private requests repeat the first
+    provider error once, including an unknown paid outcome, then stop. Polling
+    never starts another attempt pair. Use restart=True only after a fresh explicit
+    owner request to retry a terminal failure or expired result; cancel is not restart.
 
     The returned text is a machine transcript, not a verbatim quote: proper
     names, punctuation and occasional words drift under every engine.
@@ -1734,7 +1737,14 @@ async def transcribe_voice(
         # Cache-first and locked by (chat, message, engine): two concurrent
         # calls for the same recording pay the engine once, not twice.
         result = await transcription.transcribe_cached(
-            cl, entity, msg, chosen_engine, numeric_chat_id, duration=duration, cancel=cancel
+            cl,
+            entity,
+            msg,
+            chosen_engine,
+            numeric_chat_id,
+            duration=duration,
+            cancel=cancel,
+            restart=restart,
         )
 
         transcription.check_transcript_access(numeric_chat_id, operation=True)
@@ -1780,10 +1790,16 @@ async def transcribe_voice(
                     "fallback_reason": result.get("fallback_reason"),
                     "duration": duration,
                     "detail": (
-                        "Do not retry automatically; the provider outcome may be unknown."
-                        if reason == "provider_outcome_unknown"
-                        else "No complete transcript was produced."
+                        result["error"]
+                        if result.get("retry_exhausted")
+                        else (
+                            "Do not retry automatically; the provider outcome may be unknown."
+                            if reason == "provider_outcome_unknown"
+                            else "No complete transcript was produced."
+                        )
                     ),
+                    "retry_exhausted": result.get("retry_exhausted", False),
+                    "attempts": result.get("attempts"),
                 },
                 ensure_ascii=False,
             )

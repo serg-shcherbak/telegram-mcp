@@ -6,14 +6,25 @@ Direct `transcribe_voice` requests cover known short, supported audio. Long, unk
 oversized or conversion-requiring inputs become persisted start/poll/cancel jobs with
 one active operation. Each part and result rechecks permission and source identity.
 Parts carry continuous PCM sample offsets; unknown provider outcomes and unprocessed
-ranges remain explicit after restart. There is no automatic paid retry or queue.
+ranges remain explicit after restart. The first provider error repeats once immediately,
+including an unknown paid outcome. A second error stops, reports failure and preserves
+completed parts; there is no third automatic request or native fallback. There is no queue.
 A failed/expired identity does not restart on polling; cancellation does not reset it.
+A fresh explicit owner request can use `restart=True` on the same tool. Retained successful
+parts are reused; expired successful jobs can be generated again without manual editing.
+Scope/source/configuration revalidation precedes the second POST, and the same file is
+rewound without a second download. Local limits and cancellation do not trigger retry.
+For direct private uploads, provider timeouts fit the actual remaining MCP tool deadline,
+with time reserved for the second attempt and fresh checks/response. Retry validation
+recomputes the second allowance. Long jobs ignore the inherited short tool deadline;
+generic provider timeouts remain unchanged. Explicit cancellation still stops uploads.
 
 The isolated converter receives source/scratch files over a Unix socket, emits mono
 16 kHz PCM WAV parts of at most ten minutes/24,000,000 bytes, and removes source/parts
 after use. It has no network, credentials, Telegram session or host Docker socket.
 The main process owns scratch outside allowed media roots. Limits are 256 MiB source,
-four decoded hours and two hours job wall time. These are rejection boundaries, not
+four decoded hours and two hours job wall time. The converter acknowledgement wait
+covers that bounded wall budget, including two provider attempts. These are rejection boundaries, not
 proof of live-provider acceptance at every maximum.
 
 ## Measured synthetic conversion, 10 November 2026
