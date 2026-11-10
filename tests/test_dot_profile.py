@@ -1444,12 +1444,15 @@ async def test_private_direct_provider_retry_fits_actual_tool_deadline(
     owner_config, core_client, direct_audio, monkeypatch, second_succeeds
 ):
     path, _ = owner_config
-    monkeypatch.setenv("TELEGRAM_TOOL_TIMEOUT_SECONDS", "0.6")
+    # Real SDK/SQLite work under coverage needs room beyond the simulated waits.
+    tool_timeout = 3.0
+    download_delay = 0.12
+    monkeypatch.setenv("TELEGRAM_TOOL_TIMEOUT_SECONDS", str(tool_timeout))
     posts, timeouts, cancelled, downloads = [], [], [], []
 
     async def download(*args, **kwargs):
         downloads.append(1)
-        await asyncio.sleep(0.12)
+        await asyncio.sleep(download_delay)
         kwargs["file"].write(b"synthetic-input")
         return kwargs["file"]
 
@@ -1512,5 +1515,7 @@ async def test_private_direct_provider_retry_fits_actual_tool_deadline(
     assert posts == [b"synthetic-input", b"synthetic-input"]
     assert downloads == [1]
     assert cancelled == ([1] if second_succeeds else [1, 2])
-    assert len(timeouts) == 2 and all(0 < timeout < 0.18 for timeout in timeouts)
+    assert len(timeouts) == 2 and all(
+        0 < timeout < (tool_timeout - download_delay) / 3 for timeout in timeouts
+    )
     assert timeouts[1] < timeouts[0]
