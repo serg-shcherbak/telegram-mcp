@@ -3,15 +3,17 @@
 ## Current result
 
 The local candidate returns an original as an MCP embedded binary resource over the
-authenticated private connection. Actual Dot materialization and format tasks are
-**not accepted**. A server path, a displayed URI, an SDK round trip, or a preview
-does not establish that Dot can open the original.
+authenticated private connection. The owner reported that Dot opened the synthetic
+PNG and correctly read its marker and colors. This is a successful image pilot;
+independent host-file hashing and the remaining format tasks are **not accepted**.
+A server path, a displayed URI, an SDK round trip, or a preview does not establish
+that Dot can open the original.
 
-The existing My Telegram connection exposes six older tools and cannot register
-this candidate or a staging connection. Computer Use refused access to the Dot
-application for safety reasons. That refusal was not bypassed. A separate supported
-Dot staging connection is the missing prerequisite. Production, its credentials,
-and the real Telegram account have not been changed.
+The existing My Telegram connection exposes six older tools. The owner created a
+separate synthetic tunnel and reported the PNG result from the test plugin. Computer
+Use refused access to the Dot application for safety reasons; that refusal was not
+bypassed. The remaining format evidence must still come from the actual Dot host.
+Production, its configuration, and the real Telegram account have not been changed.
 
 ## Candidate boundary
 
@@ -77,7 +79,7 @@ The fixture manifest supplies the precise source identities and answer key for:
 
 | Fixture | Task and required evidence | Local transfer | Dot original | Dot task |
 | --- | --- | --- | --- | --- |
-| Image | Read marker and identify colored regions | Exact bytes verified | Not tested | Not tested |
+| Image | Read marker and identify colored regions | Exact bytes verified | Opened, owner report | Marker and colors match |
 | Text PDF | Read the embedded text marker | Exact bytes verified | Not tested | Not tested |
 | Scanned PDF | Read the visible marker without a text layer | Exact bytes verified | Not tested | Not tested |
 | DOCX | Identify the item and quantity in its table | Exact bytes verified | Not tested | Not tested |
@@ -91,6 +93,15 @@ recognition, provider, ordinary-audio transcription, or long-audio evidence.
 Fixture-generation checks may inspect the synthetic PDF/XML/media to validate the
 answer key; the production server does not parse documents, run OCR, or analyze
 video.
+
+On 10 November the owner pasted Dot's result: the original image opened, the code
+was `IMAGE-482`, and the regions were red, green, blue from left to right. The prompt
+did not disclose those answers; neutral source metadata does not contain the code.
+The fixture source independently agrees. The active test tunnel subsequently showed
+14 polled commands with an empty queue and healthy readiness. Those aggregate
+counters corroborate connection use, not the exact image call or a host-file hash.
+The original Dot tool trace/materialized-file hash was not supplied to this chat.
+Do not extend this pilot result to the other formats or the whole release.
 
 Preserve non-secret evidence before stopping the helper with Ctrl-C; its newly
 allocated staging directory is removed on exit. Revoke/remove the separate staging
