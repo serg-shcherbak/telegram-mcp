@@ -656,6 +656,7 @@ async def test_private_audio_preflight_never_downloads_or_calls_provider(
     owner_config, core_client, direct_audio, monkeypatch, change
 ):
     path, data = owner_config
+    calls = []
     if change == "endpoint":
         monkeypatch.setenv("TELEGRAM_TRANSCRIBE_OPENAI_URL", "https://unapproved.invalid/v1")
     elif change == "key":
@@ -667,16 +668,23 @@ async def test_private_audio_preflight_never_downloads_or_calls_provider(
         direct_audio["message"].document.size = 24_000_001
 
     async def forbidden(*args, **kwargs):
+        calls.append("download")
         raise AssertionError("Provider and download must not be called")
+
+    async def forbidden_provider(*args, **kwargs):
+        calls.append("provider")
+        raise AssertionError("Provider must not be called")
 
     monkeypatch.setattr(transcription, "transcribe", direct_audio["real_transcribe"])
     monkeypatch.setattr(core_client, "download_media", forbidden, raising=False)
+    monkeypatch.setattr(transcription, "_post_audio", forbidden_provider)
     async with _server(path) as (_, app):
         async with _session(app, TOKEN_A) as session:
             result = await session.call_tool("transcribe_voice", {"chat_id": 1, "message_id": 7})
             assert result.isError, _text(result)
             if change == "size":
                 assert "too_large" in _text(result)
+    assert calls == []
 
 
 @pytest.mark.asyncio
