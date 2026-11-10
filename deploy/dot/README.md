@@ -155,10 +155,6 @@ the generic server's existing `transcripts.db` remains separate and is not purge
 private-profile retention. Unresolved short-POST checkpoints remain after text expiry.
 Keep these databases and all backups private.
 
-Known timeout limit: the converter waits 180 seconds for each part acknowledgement.
-The default provider timeout is 120 seconds; increasing it beyond the converter wait
-can interrupt conversion after a paid part. Real provider latency has not been measured.
-
 ## Start only the selected installation
 
 Set these selectors in the operator's shell or a separate private Compose environment
