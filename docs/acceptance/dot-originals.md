@@ -37,8 +37,9 @@ metadata, not independent Telegram storage authenticity.
   the original or returning it as complete.
 
 The tunnel documentation specifies a 120-second absolute deadline, including queue
-time; progress does not extend it. Neither real tunnel forwarding nor timing under
-load has been established in this run. The installed tunnel-client executable
+time; progress does not extend it. Actual test-plugin/tunnel forwarding of all seven
+small fixtures was established. Timing under load and the provisional maximum-size
+original through that route remain unmeasured. The installed tunnel-client executable
 supports origin-bound `--mcp.extra-headers` and `--mcp.discovery-extra-headers` with
 `env:`/`file:` values. No upgrade or production configuration change follows from
 that observation. [Tunnel limits](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels#limits),
@@ -124,8 +125,10 @@ record the candidate commit, dependency versions, source identity, original and
 received hashes, serialized response size, elapsed time, and observed limitations.
 Do not place the staging credential, personal messages, or session material in Git.
 
-The remaining direct-audio, long-recording, clean-install, image-build, and release
-work depends on successful actual-host acceptance. If the host rejects the binary
+The successful actual-host gate allowed direct-audio and long-recording implementation
+to proceed; [long-audio evidence](long-audio.md) records its separate synthetic scope.
+Clean-install, image-build and actual fork CI results must be recorded for the release
+commit. If a later host rejects the binary
 resource or a requested format, preserve the exact refusal and return the blocker.
 Changing the host transfer mechanism or the product acceptance scope requires a
 new explicit decision. No public media route or server parser is an automatic

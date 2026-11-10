@@ -48,6 +48,9 @@ requirements.txt
 **/.cache/**
 **/logs/**
 **/data/**
+**/media/**
+**/audio/**
+**/backups/**
 **/*.log
 **/aliases.json
 **/incoming_feed.jsonl

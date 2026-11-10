@@ -9,9 +9,15 @@
 
 A Telegram integration for Claude, Cursor, and other MCP-compatible clients. It exposes Telegram account, chat, message, contact, media, folder, and admin operations through the [Model Context Protocol](https://modelcontextprotocol.io/) using [Telethon](https://docs.telethon.dev/).
 
-The [private Dot installation](deploy/dot/README.md) is under development. Original-file
-acceptance in Dot, image build, and this fork's release CI remain pending. The badges above
-report upstream checks.
+The [private Dot installation](deploy/dot/README.md) provides a scoped, authenticated
+single-owner profile using an existing own session. Small synthetic PNG, PDF/scan,
+DOCX, XLSX, WAV and MP4 originals passed actual Dot acceptance. Direct audio and
+persisted long-audio jobs are implemented; live provider accuracy/latency is unmeasured.
+Use its frozen Python 3.13.12 / uv 0.11.3 installation and private Dockerfiles.
+Release readiness requires the exact commit's package, clean-install, image and actual
+fork CI checks; deployment is separate. Observation stays off. The badges above report
+upstream checks. See [originals](docs/acceptance/dot-originals.md) and
+[long-audio evidence](docs/acceptance/long-audio.md) for verified coverage and limits.
 
 ## 🤖 MCP in Action
 

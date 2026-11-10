@@ -13,6 +13,7 @@
 !deploy/
 !deploy/dot/
 !deploy/dot/Dockerfile
+!deploy/dot/Converter.Dockerfile
 !deploy/dot/dot_server.py
 **/__pycache__/
 **/*.pyc
@@ -32,6 +33,9 @@
 **/.cache/
 **/logs/
 **/data/
+**/media/
+**/audio/
+**/backups/
 **/*.log
 **/aliases.json
 **/incoming_feed.jsonl

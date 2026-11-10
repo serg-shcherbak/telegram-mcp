@@ -28,6 +28,9 @@ PRIVATE_PATHS = (
     ".cache/private.txt",
     "logs/private.txt",
     "data/private.txt",
+    "media/private.png",
+    "audio/private.wav",
+    "backups/private.txt",
     "aliases.json",
     "incoming_feed.jsonl",
     "mcp_errors.log",
@@ -59,6 +62,10 @@ def disposable_project(tmp_path):
         ".mcpbignore",
     ):
         shutil.copyfile(ROOT / name, project / name)
+    for name in ("Dockerfile", "Converter.Dockerfile", "dot_server.py"):
+        target = project / "deploy/dot" / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(ROOT / "deploy/dot" / name, target)
     for source in (ROOT / "telegram_mcp").rglob("*.py"):
         target = project / source.relative_to(ROOT)
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -160,6 +167,33 @@ def test_official_mcp_bundle_excludes_private_material(disposable_project, tmp_p
     _assert_clean_archive(output)
 
 
+def test_docker_context_excludes_private_material(disposable_project, tmp_path):
+    if os.getenv("DOT_DOCKER_TESTS") != "1":
+        pytest.skip("Set DOT_DOCKER_TESTS=1 with an isolated Docker builder")
+    output = tmp_path / "context"
+    result = subprocess.run(
+        [
+            "docker",
+            "build",
+            "--file",
+            "-",
+            "--output",
+            f"type=local,dest={output}",
+            str(disposable_project),
+        ],
+        input="FROM scratch\nCOPY . /\n",
+        text=True,
+        capture_output=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    files = [path for path in output.rglob("*") if path.is_file()]
+    assert files
+    assert all(MARKER not in path.read_bytes() for path in files)
+    assert (output / "deploy/dot/Converter.Dockerfile").is_file()
+    assert (output / "telegram_mcp/audio_converter.py").is_file()
+
+
 def test_compose_resolves_private_mounts_and_loopback_limits(tmp_path):
     if not shutil.which("docker"):
         pytest.skip("Docker Compose CLI is unavailable")
@@ -191,12 +225,16 @@ def test_compose_resolves_private_mounts_and_loopback_limits(tmp_path):
     )
     assert result.returncode == 0, result.stderr
     service = json.loads(result.stdout)["services"]["telegram-mcp"]
+    assert service["user"] == "1000:1000"
     assert all(port["host_ip"] == "127.0.0.1" for port in service["ports"])
     assert int(service["mem_limit"]) == int(service["memswap_limit"]) == 384 * 1024**2
     assert float(service["cpus"]) == 0.25
     assert service["pids_limit"] == 64
     assert service["cap_drop"] == ["ALL"]
     assert "no-new-privileges:true" in service["security_opt"]
+    assert service["environment"]["TELEGRAM_EVENT_FEED"] == "0"
+    assert service["environment"]["TELEGRAM_LEGACY_EVENTS"] == "0"
+    assert service["environment"]["TELEGRAM_AUDIO_SCRATCH_DIR"] == "/app/state/audio"
     mounts = {mount["target"]: mount for mount in service["volumes"]}
     assert set(mounts) == {"/app/session", "/app/config", "/app/state"}
     assert mounts["/app/config"]["read_only"] is True

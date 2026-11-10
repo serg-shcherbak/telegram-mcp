@@ -2,6 +2,7 @@ name: telegram-dot
 services:
   telegram-mcp:
     image: ${TELEGRAM_DOT_IMAGE:?Set an immutable image tag built from the reviewed commit}
+    user: '1000:1000'
     env_file: ${TELEGRAM_DOT_ENV_FILE:?Set an absolute private environment file path}
     environment:
       MCP_TRANSPORT: http

@@ -221,4 +221,7 @@ cache/
 .cache/
 logs/
 data/
+media/
+audio/
+backups/
 *.log

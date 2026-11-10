@@ -7,31 +7,23 @@ on:
     branches: [ main ]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   lint-and-format:
-    name: Check Linting & Formatting
+    name: Frozen lint and formatting
     runs-on: ubuntu-latest
-
     steps:
-      - name: Check out repository code
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-          cache: 'pip'
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install black flake8
-
-      - name: Lint with Flake8
-        run: |
-          flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
-          flake8 . --count --exit-zero --statistics
-
-      - name: Check formatting with Black
-        run: |
-          black --check .
+          python-version: '3.13.12'
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: '0.11.3'
+      - run: uv sync --frozen --python 3.13.12
+      - name: Reject fatal Python errors
+        run: uv run --frozen --no-sync flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+      - name: Check formatting
+        run: uv run --frozen --no-sync black --check .

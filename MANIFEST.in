@@ -7,4 +7,7 @@ prune cache
 prune .cache
 prune logs
 prune data
-recursive-exclude * state/* sessions/* transcripts/* cache/* .cache/* logs/* data/* __pycache__/*
+prune media
+prune audio
+prune backups
+recursive-exclude * state/* sessions/* transcripts/* cache/* .cache/* logs/* data/* media/* audio/* backups/* __pycache__/*
