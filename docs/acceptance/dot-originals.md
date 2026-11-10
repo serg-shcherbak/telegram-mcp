@@ -2,18 +2,22 @@
 
 ## Current result
 
-The local candidate returns an original as an MCP embedded binary resource over the
-authenticated private connection. The owner reported that Dot opened the synthetic
-PNG and correctly read its marker and colors. This is a successful image pilot;
-independent host-file hashing and the remaining format tasks are **not accepted**.
-A server path, a displayed URI, an SDK round trip, or a preview does not establish
-that Dot can open the original.
+The private original-transfer gate passed on 10 November 2026 for all seven small
+synthetic fixtures. The owner reported actual Dot materialization and correct
+known-answer tasks for PNG, text PDF, scanned PDF, DOCX, XLSX, WAV and MP4, including
+album relationships and video time ranges. The owner also reports hashing the six
+document/audio/video originals from received bytes, matching export metadata.
+The agent subsequently retrieved all seven through the actual test-plugin/tunnel
+route, materialized and hashed the response bytes, and verified their structure.
+These are separate observations. Neither establishes arbitrary-size/codec support,
+real Telegram storage integrity, external ASR, or release readiness.
 
-The existing My Telegram connection exposes six older tools. The owner created a
-separate synthetic tunnel and reported the PNG result from the test plugin. Computer
-Use refused access to the Dot application for safety reasons; that refusal was not
-bypassed. The remaining format evidence must still come from the actual Dot host.
-Production, its configuration, and the real Telegram account have not been changed.
+The owner created the separate synthetic plugin/tunnel using the supported flow.
+Computer Use's earlier refusal was not bypassed. The real My Telegram installation,
+its configuration, and its Telegram account have not been changed. Server document
+parsers, OCR, video analysis and a public media route were not added; analysis ran
+on the Dot/client side. The reported hashes validate transport relative to plugin
+metadata, not independent Telegram storage authenticity.
 
 ## Candidate boundary
 
@@ -80,13 +84,13 @@ The fixture manifest supplies the precise source identities and answer key for:
 | Fixture | Task and required evidence | Local transfer | Dot original | Dot task |
 | --- | --- | --- | --- | --- |
 | Image | Read marker and identify colored regions | Exact bytes verified | Opened, owner report | Marker and colors match |
-| Text PDF | Read the embedded text marker | Exact bytes verified | Not tested | Not tested |
-| Scanned PDF | Read the visible marker without a text layer | Exact bytes verified | Not tested | Not tested |
-| DOCX | Identify the item and quantity in its table | Exact bytes verified | Not tested | Not tested |
-| XLSX | Inspect both sheets; distinguish formula from cached value | Exact bytes verified | Not tested | Not tested |
-| WAV | Identify the synthetic tone and its covered duration | Exact bytes verified | Not tested | Not tested |
-| MP4 | Identify the color sequence and time ranges | Exact bytes verified | Not tested | Not tested |
-| Album sources | Preserve shared group and individual source identities | Exact bytes verified | Not tested | Not tested |
+| Text PDF | Read the embedded text marker | Exact bytes verified | Opened, owner report | Code, both pages and final total match |
+| Scanned PDF | Read the visible marker without a text layer | Exact bytes verified | Opened, owner report | Code and total match; client OCR/visual check |
+| DOCX | Identify the item and quantity in its table | Exact bytes verified | Opened, owner report | Code and table match; client structure/library analysis |
+| XLSX | Inspect both sheets; distinguish formula from cached value | Exact bytes verified | Opened, owner report | Sheets, formula and saved value match; no Excel recalculation |
+| WAV | Identify the synthetic tone and its covered duration | Exact bytes verified | Opened, owner report | Duration, tone frequency and absence of speech match |
+| MP4 | Identify the color sequence and time ranges | Exact bytes verified | Opened, owner report | Duration, sampled colors and absence of audio track match |
+| Album sources | Preserve shared group and individual source identities | Exact bytes verified | Retrieved in Dot | Messages 1 and 3 in album 901 match |
 
 The synthetic tone tests original delivery and playback only. It supplies no speech
 recognition, provider, ordinary-audio transcription, or long-audio evidence.
@@ -100,8 +104,13 @@ did not disclose those answers; neutral source metadata does not contain the cod
 The fixture source independently agrees. The active test tunnel subsequently showed
 14 polled commands with an empty queue and healthy readiness. Those aggregate
 counters corroborate connection use, not the exact image call or a host-file hash.
-The original Dot tool trace/materialized-file hash was not supplied to this chat.
-Do not extend this pilot result to the other formats or the whole release.
+At that first checkpoint the original Dot tool trace/materialized-file hash was not
+supplied to this chat. A later owner report covers the remaining formats and reports
+computed byte hashes; the literal hash strings were not pasted. The subsequently
+available test-plugin tools let the agent independently record all seven actual
+EmbeddedResource byte hashes and match the controlled contents. The per-file
+results and qualification are retained in the workspace evidence. No real account
+or personal media was used.
 
 Preserve non-secret evidence before stopping the helper with Ctrl-C; its newly
 allocated staging directory is removed on exit. Revoke/remove the separate staging
